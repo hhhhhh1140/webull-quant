@@ -1,0 +1,10 @@
+.venv/
+.env
+conf/
+state/
+logs/
+data/cache/
+__pycache__/
+*.pyc
+webull_*_sdk.log
+KILL_SWITCH
