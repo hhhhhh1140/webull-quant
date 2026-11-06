@@ -1,0 +1,65 @@
+# ===== webull-quant 配置 =====
+
+# 交易标的池（同时作为下单白名单，池外股票一律拒绝）
+universe:
+  - SPY
+  - QQQ
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+
+# 执行模式:
+#   dry_run  - 只打印决策和订单，不调用下单接口
+#   paper    - 本地模拟撮合（不连 Webull 下单）
+#   webull   - 调用 Webull 下单接口（环境由 .env 的 WEBULL_ENVIRONMENT 决定）
+mode: dry_run
+
+# 实盘总开关。即使 WEBULL_ENVIRONMENT=prod，这里不为 true 也不会下实盘单。
+# 另外运行时还需要加 --confirm-live 参数。三道锁缺一不可。
+live_trading_enabled: false
+
+# ---- 规则层：技术面筛选（产生候选，AI 只能在候选里做决定）----
+strategy:
+  sma_fast: 50
+  sma_slow: 200
+  rsi_period: 14
+  rsi_max_entry: 70        # RSI 高于此值不追高
+  momentum_lookback: 20    # 20 日动量需 > 0
+  atr_period: 14
+  atr_stop_mult: 2.5       # 跟踪止损 = 最高收盘价 - N * ATR
+  exit_below_fast_sma: true
+
+# ---- AI 分析层 ----
+ai:
+  enabled: true
+  model: claude-opus-5-5
+  effort: high
+  min_confidence: 0.6      # 低于此置信度的 BUY 不执行
+  news_items: 8            # 每只股票喂给模型的新闻条数
+  # AI 能否否决规则层的卖出信号？默认不能——止损永远优先
+  can_veto_exits: false
+
+# ---- 风控层（对所有模式生效，包括回测）----
+risk:
+  max_position_pct: 0.10       # 单只股票最多占总资产 10%
+  max_positions: 6             # 最多同时持仓数
+  max_order_notional: 5000     # 单笔订单金额上限（美元）
+  max_daily_loss_pct: 0.03     # 当日亏损超过 3% 停止开新仓
+  cash_buffer_pct: 0.05        # 保留 5% 现金
+  min_order_notional: 100      # 低于此金额的订单忽略
+
+# ---- 订单 ----
+order:
+  type: LIMIT                  # LIMIT 或 MARKET
+  limit_offset_bps: 20         # 限价相对最新价的偏移（买入加价 / 卖出减价），单位 bp
+  time_in_force: DAY
+
+# ---- 回测 ----
+backtest:
+  initial_cash: 100000
+  commission_per_trade: 0.0
+  slippage_bps: 5
+  bars: 1200                   # Webull 单次最多 1200 根日线（约 4.7 年）
