@@ -91,6 +91,9 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(broker, "ROOT", tmp_path)
     monkeypatch.setattr(engine, "DECISIONS", tmp_path / "decisions")
     monkeypatch.setattr(engine, "ROOT", tmp_path)
+    import wquant.events as events
+    monkeypatch.setattr(events, "EVENTS_FILE", tmp_path / "events.yaml")
+    monkeypatch.setattr(events, "EARNINGS_CACHE", tmp_path / "earnings.json")
     return engine
 
 
@@ -407,3 +410,54 @@ def test_buy_and_hold_handles_late_listing():
     b = synthetic_bars("B", 100, seed=2)        # 晚上市
     bh = buy_and_hold({"A": a, "B": b}, 100_000)
     assert bh.index[0] == a.index[0] and not bh.isna().any()
+
+
+def test_event_restrictions():
+    from datetime import datetime
+    from wquant.events import ET, restrictions, upcoming
+    evs = [
+        {"type": "macro", "importance": "high", "date": "2026-11-10", "time_et": "08:30", "name": "CPI"},
+        {"type": "macro", "importance": "medium", "date": "2026-11-10", "time_et": "10:00", "name": "小数据"},
+        {"type": "earnings", "importance": "high", "symbol": "NVDA", "date": "2026-11-17", "time_et": "AMC", "name": "NVDA 财报"},
+    ]
+    cfg = {"enabled": True, "lookahead_hours": 24, "pre_event_size_factor": 0.5, "earnings_blackout_days": 3}
+    # CPI 前一天上午：仓位减半；NVDA 还远，不限制
+    r = restrictions(evs, datetime(2026, 11, 9, 9, 45, tzinfo=ET), cfg)
+    assert r["size_factor"] == 0.5 and "NVDA" not in r["blocked"]
+    # CPI 公布后：不再限制
+    r = restrictions(evs, datetime(2026, 11, 10, 9, 45, tzinfo=ET), cfg)
+    assert r["size_factor"] == 1.0
+    # NVDA 财报前 3 个交易日内：不买 NVDA
+    r = restrictions(evs, datetime(2026, 11, 13, 9, 45, tzinfo=ET), cfg)
+    assert "NVDA" in r["blocked"]
+    # 财报当天收盘后已公布：解除
+    r = restrictions(evs, datetime(2026, 11, 18, 9, 45, tzinfo=ET), cfg)
+    assert "NVDA" not in r["blocked"]
+    # upcoming 标出是否已公布
+    up = upcoming(evs, datetime(2026, 11, 10, 9, 45, tzinfo=ET), days=7)
+    assert [e["released"] for e in up if e["name"] == "CPI"] == [True]
+    assert restrictions(evs, datetime(2026, 11, 9, 9, 45, tzinfo=ET), {**cfg, "enabled": False})["size_factor"] == 1.0
+
+
+def test_execute_applies_event_rules(tmp_path, monkeypatch):
+    import json
+    from datetime import date
+    engine = _isolate(tmp_path, monkeypatch)
+    import wquant.events as events
+    s = _settings()
+    s.raw["events"] = {"enabled": True, "lookahead_hours": 24, "pre_event_size_factor": 0.5, "earnings_blackout_days": 3}
+    path = engine.scan(s, source="synthetic")
+    buys = [c["symbol"] for c in json.loads(path.read_text())["candidates"] if c["action"] == "BUY"]
+    assert len(buys) >= 2
+    # 第一只马上要发财报 → 拦截；另有一个 12 小时后公布的宏观事件 → 其余仓位减半
+    from datetime import datetime, timedelta
+    soon = datetime.now(events.ET) + timedelta(hours=12)
+    monkeypatch.setattr(events, "all_events", lambda: [
+        {"type": "earnings", "importance": "high", "symbol": buys[0], "date": str(date.today()), "time_et": "23:59", "name": "x"},
+        {"type": "macro", "importance": "high", "date": soon.date().isoformat(), "time_et": soon.strftime("%H:%M"), "name": "CPI"}])
+    decs = [{"symbol": b, "action": "APPROVE", "confidence": 0.9, "conviction": 1.0, "reasoning": "x"} for b in buys]
+    (path.parent / "decisions.json").write_text(json.dumps({"date": str(date.today()), "decisions": decs}))
+    res = {r["symbol"]: r for r in engine.execute(s, review="file", source="synthetic")}
+    assert res[buys[0]]["outcome"] == "rejected_by_event"
+    o = res[buys[1]]["order"]
+    assert o["quantity"] * o["price"] <= 100_000 * 0.10 * 0.5 + o["price"]

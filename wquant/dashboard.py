@@ -248,8 +248,17 @@ def _market(settings: Settings) -> dict | None:
     return out
 
 
+def _events(settings: Settings) -> dict:
+    from . import events as ev
+    now = datetime.now(ev.ET)
+    allv = ev.all_events()
+    return {"now_et": now.isoformat(timespec="minutes"), "items": ev.upcoming(allv, now, days=14, past_days=5),
+            "restrictions": ev.restrictions(allv, now, settings.section("events"))}
+
+
 def collect(settings: Settings) -> dict:
     data = {"generated_at": datetime.now().isoformat(timespec="seconds"), "environment": settings.environment,
+            "events": _events(settings),
             "market": _market(settings),
             "region": settings.region_id, "mode": settings.mode, "ai_mode": settings.section("ai").get("mode"),
             "live_trading_enabled": settings.live_trading_enabled, "universe": settings.universe,

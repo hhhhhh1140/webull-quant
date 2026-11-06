@@ -160,6 +160,15 @@ def scan(settings: Settings, source: str = "webull", force: bool = False) -> Pat
     signals = [s for s in signals if not (s.action == "BUY" and s.symbol in open_hedges)]
     from .sentiment import compute as compute_sentiment
     senti = compute_sentiment(settings, all_frames, client)
+    from . import events as ev
+    if client is not None:
+        stocks = [s for s in frames if settings.instrument(s)["leverage"] <= 1 and settings.groups.get(s) != "index"]
+        ev.refresh_earnings(client, stocks)
+    now_et = datetime.now(ev.ET)
+    all_ev = ev.all_events()
+    event_cfg = settings.section("events")
+    upcoming_ev = ev.upcoming(all_ev, now_et, days=7, past_days=3)
+    restr = ev.restrictions(all_ev, now_et, event_cfg)
     blocked = []
     if regime["risk_off"]:
         # 反向 ETF（如 SOXS）不受大盘过滤限制
@@ -199,6 +208,8 @@ def scan(settings: Settings, source: str = "webull", force: bool = False) -> Pat
         "market": regime,
         "sentiment": senti,
         "last_market_view": prev_view,
+        "events": upcoming_ev,
+        "event_restrictions_at_scan": restr,
         "hedge_rules": {**hedge_cfg, "open_hedges": open_hedges},
         "hedge_quotes": {s: {**price_summary(frames[s]), "atr": round(float(frames[s]["atr"].iloc[-1]), 4),
                              "instrument": settings.instrument(s), "held": s in held}
@@ -229,6 +240,13 @@ def scan(settings: Settings, source: str = "webull", force: bool = False) -> Pat
         print(f"上次市场研判（{prev_view['date']}）: {prev_view['regime']}  置信度 {prev_view.get('confidence', 0):.2f}")
     for s, h in open_hedges.items():
         print(f"  当前对冲: {s}（{h.get('entry_date')} 买入）")
+    for e in upcoming_ev:
+        tag = "已公布" if e["released"] else f"{e['hours_until']:+.0f}h"
+        print(f"  事件: {e['date']} {e.get('time_et', '')} {e.get('name')}（{tag}）")
+    for r in restr["reasons"]:
+        print(f"  事件限制: {r}")
+    for s, r in restr["blocked"].items():
+        print(f"  财报限制: {s} {r}")
     for b in blocked:
         print(f"  [BUY 已拦截] {b['symbol']} @ {b['price']:.2f} — 大盘过滤")
     if not candidates:
@@ -337,6 +355,10 @@ def execute(settings: Settings, review: str, confirm_live: bool = False, source:
 
     sod = journal.start_of_day_equity(acct.equity)
     print(f"[execute] 模式={settings.mode}  环境={settings.environment}  审核={review}")
+    from . import events as ev
+    restr = ev.restrictions(ev.all_events(), datetime.now(ev.ET), settings.section("events"))
+    for r in restr["reasons"]:
+        print(f"事件限制: {r}")
     n_pos, cash = len(acct.positions), acct.cash
     groups = settings.groups
     held_groups = [groups.get(s) for s in acct.positions]
@@ -366,9 +388,18 @@ def execute(settings: Settings, review: str, confirm_live: bool = False, source:
             results.append(entry)
             continue
 
+        if sig.action == "BUY" and sig.symbol in restr["blocked"]:
+            print(f"  财报限制: {restr['blocked'][sig.symbol]}")
+            entry.update(outcome="rejected_by_event", risk_notes=[restr["blocked"][sig.symbol]])
+            journal.record("decision", **entry)
+            results.append(entry)
+            continue
         if sig.action == "BUY":
             g = groups.get(sig.symbol)
-            rd = rm.size_buy(sig.symbol, sig.price, acct.equity, cash, n_pos, dec.conviction, sod,
+            conv = dec.conviction * restr["size_factor"]
+            if restr["size_factor"] < 1:
+                print(f"  事件前仓位系数 {dec.conviction:.2f} → {conv:.2f}")
+            rd = rm.size_buy(sig.symbol, sig.price, acct.equity, cash, n_pos, conv, sod,
                              leverage=settings.instrument(sig.symbol)["leverage"], group=g,
                              group_count=held_groups.count(g))
         else:

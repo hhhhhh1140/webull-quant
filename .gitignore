@@ -9,3 +9,4 @@ __pycache__/
 webull_*_sdk.log
 KILL_SWITCH
 decisions/
+.DS_Store

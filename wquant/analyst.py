@@ -35,6 +35,10 @@ class MarketView(BaseModel):
     summary: str
     drivers: list[str] = []
     catalysts: list[str] = []
+    # 事件前推演：[{event, consensus, scenarios: [{name, condition, expected_reaction, system_response}]}]
+    event_scenarios: list[dict] = []
+    # 事件后复盘：[{event, actual, market_reaction, matched_scenario, lesson}]
+    event_reviews: list[dict] = []
 
 
 class HedgeProposal(BaseModel):

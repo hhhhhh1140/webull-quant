@@ -16,6 +16,7 @@
 - WEBULL_ENVIRONMENT=prod 时，Claude 不运行 `execute`、不下单，只把命令交给用户。
 - 不要读取或打印 `.env`，不要把密钥写进任何文件或输出。
 - 风控参数（config.yaml 的 `risk`）和 `KILL_SWITCH` 文件只在用户明确要求时修改。
+- `events.yaml`（宏观事件日历）由 Claude 在审核时维护：补事件、预期和实际值，查不到确切日期就不写。
 - 改代码后运行 `.venv/bin/python -m pytest -q`。
 
 ## 结构
