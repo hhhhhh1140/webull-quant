@@ -52,11 +52,50 @@ def cmd_backtest(args, s):
     return 0
 
 
-def cmd_run(args, s):
-    from .engine import run_once
-    if args.mode:
+def _apply_mode(args, s):
+    if getattr(args, "mode", None):
         s.raw["mode"] = args.mode
-    run_once(s, source=args.source, confirm_live=args.confirm_live, use_ai=False if args.no_ai else None)
+
+
+def cmd_scan(args, s):
+    from .engine import scan
+    _apply_mode(args, s)
+    return 0 if scan(s, source=args.source) else 1
+
+
+def cmd_execute(args, s):
+    from .engine import execute
+    _apply_mode(args, s)
+    review = args.review or {"claude_code": "file", "api": "api", "off": "off"}[s.section("ai").get("mode", "claude_code")]
+    execute(s, review=review, confirm_live=args.confirm_live, source=args.source)
+    return 0
+
+
+def cmd_run(args, s):
+    """scan + execute。ai.mode=claude_code 时只做 scan，等 Claude Code 审核后再 execute。"""
+    from .engine import execute, scan
+    _apply_mode(args, s)
+    ai_mode = "off" if args.no_ai else s.section("ai").get("mode", "claude_code")
+    if not scan(s, source=args.source):
+        return 1
+    if ai_mode == "claude_code":
+        print("\n下一步：在 Claude Code 里运行 /trade-review 审核候选，然后执行 `python -m wquant execute`")
+        return 0
+    execute(s, review="api" if ai_mode == "api" else "off", confirm_live=args.confirm_live, source=args.source)
+    return 0
+
+
+def cmd_status(args, s):
+    from .engine import day_dir
+    d = day_dir()
+    c, dec = d / "candidates.json", d / "decisions.json"
+    print(f"今天: {d.name}")
+    if not c.exists():
+        print("  还没有 scan")
+        return 0
+    packet = json.loads(c.read_text(encoding="utf-8"))
+    print(f"  候选 {len(packet['candidates'])} 个（生成于 {packet['generated_at']}，环境 {packet['environment']}）")
+    print(f"  审核结论: {'已写入' if dec.exists() else '还没有'}")
     return 0
 
 
@@ -76,15 +115,26 @@ def main(argv=None) -> int:
     b.add_argument("--source", choices=["webull", "cache", "synthetic"], default="cache")
     b.add_argument("--trades", type=int, default=0, help="打印最后 N 笔交易")
 
-    r = sub.add_parser("run", help="执行一次每日流程（信号 → AI → 风控 → 下单）")
-    r.add_argument("--mode", choices=["dry_run", "paper", "webull"], help="覆盖 config.yaml 中的 mode")
-    r.add_argument("--source", choices=["webull", "cache", "synthetic"], default="webull")
-    r.add_argument("--no-ai", action="store_true", help="跳过 AI 审核，纯规则执行")
-    r.add_argument("--confirm-live", action="store_true", help="实盘下单的最后一道确认")
+    def common(sp, live=False):
+        sp.add_argument("--mode", choices=["dry_run", "paper", "webull"], help="覆盖 config.yaml 中的 mode")
+        sp.add_argument("--source", choices=["webull", "cache", "synthetic"], default="webull")
+        if live:
+            sp.add_argument("--confirm-live", action="store_true", help="实盘下单的最后一道确认")
+
+    common(sub.add_parser("scan", help="阶段1：生成今日候选包 decisions/<日期>/candidates.json"))
+    e = sub.add_parser("execute", help="阶段2：读审核结论 → 风控 → 下单")
+    common(e, live=True)
+    e.add_argument("--review", choices=["file", "api", "off"], help="审核来源，默认按 ai.mode")
+    r = sub.add_parser("run", help="scan + execute（claude_code 模式下只做 scan）")
+    common(r, live=True)
+    r.add_argument("--no-ai", action="store_true", help="跳过审核，纯规则执行")
+    sub.add_parser("status", help="查看今天的候选和审核状态")
 
     args = p.parse_args(argv)
     s = load_settings(args.config)
-    return {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "run": cmd_run}[args.cmd](args, s)
+    cmds = {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
+            "execute": cmd_execute, "run": cmd_run, "status": cmd_status}
+    return cmds[args.cmd](args, s)
 
 
 if __name__ == "__main__":

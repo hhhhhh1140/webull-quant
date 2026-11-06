@@ -32,15 +32,19 @@ strategy:
   atr_stop_mult: 2.5       # 跟踪止损 = 最高收盘价 - N * ATR
   exit_below_fast_sma: true
 
-# ---- AI 分析层 ----
+# ---- 审核层 ----
 ai:
-  enabled: true
-  model: claude-opus-5-5
-  effort: high
+  # claude_code - 由 Claude Code 审核候选并写 decisions.json（用订阅额度，程序不调用付费 API）
+  # api         - 程序直接调用 Claude API（按 token 计费，需要 ANTHROPIC_API_KEY）
+  # off         - 不审核，规则信号直接进入风控
+  mode: claude_code
   min_confidence: 0.6      # 低于此置信度的 BUY 不执行
-  news_items: 8            # 每只股票喂给模型的新闻条数
-  # AI 能否否决规则层的卖出信号？默认不能——止损永远优先
+  news_items: 8            # 每只股票放进候选包的新闻条数
+  # 审核能否否决规则层的卖出信号？默认不能——止损永远优先
   can_veto_exits: false
+  # 以下仅 mode: api 时使用
+  api_model: claude-opus-5-5
+  api_effort: high
 
 # ---- 风控层（对所有模式生效，包括回测）----
 risk:
