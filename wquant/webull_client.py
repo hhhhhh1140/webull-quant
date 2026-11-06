@@ -18,11 +18,19 @@ log = logging.getLogger(__name__)
 # SDK 自带的 endpoints.json 只包含生产环境，沙盒需要手动注入
 UAT_ENDPOINTS = {
     "us": {
-        "api": "us-openapi-alb.uat.webullbroker.com",
-        "quotes-api": "us-openapi-quotes-api.uat.webullbroker.com",
-        "events-api": "us-openapi-events.uat.webullbroker.com",
+        "api": "api.sandbox.webull.com",
+        "quotes-api": "api.sandbox.webull.com",
+        "events-api": "events-api.sandbox.webull.com",
+    },
+    "hk": {
+        "api": "api.sandbox.webull.hk",
+        "quotes-api": "api.sandbox.webull.hk",   # developer.webull.hk：行情 HTTP 与交易同一主机
+        "events-api": "events-api.sandbox.webull.hk",
     },
 }
+
+# 系统交易美股，资金统一按美元计算（香港等多币种账户也一样）
+BASE_CURRENCY = "USD"
 
 
 def _json(resp: Any) -> Any:
@@ -62,6 +70,8 @@ class WebullClient:
             token_check_interval_seconds=5 if interactive_auth else 3,
         )
         if settings.token_dir:
+            from pathlib import Path
+            Path(settings.token_dir).mkdir(parents=True, exist_ok=True)
             api.set_token_dir(settings.token_dir)
         if settings.environment == "uat":
             eps = UAT_ENDPOINTS.get(settings.region_id)
@@ -69,7 +79,7 @@ class WebullClient:
                 raise RuntimeError(f"暂未配置 {settings.region_id} 区域的沙盒地址")
             for key, api_type in (("api", DEFAULT), ("quotes-api", QUOTES), ("events-api", EVENTS)):
                 api.add_endpoint(settings.region_id, eps[key], api_type)
-        api.set_stream_logger(log_level=logging.WARNING, stream=sys.stderr)
+        api.set_stream_logger(log_level=logging.CRITICAL, stream=sys.stderr)  # SDK 出错时会把整个请求打出来，太吵；错误由调用方处理
         self.trade = TradeClient(api)
         self.data = DataClient(api)
         self._account_id: str | None = None
@@ -115,19 +125,33 @@ class WebullClient:
     def balance(self) -> dict:
         return _json(self.trade.account_v2.get_account_balance(self.account_id)) or {}
 
-    def equity(self) -> float:
+    def _currency_row(self, b: dict) -> dict | None:
+        for row in b.get("account_currency_assets") or []:
+            if row.get("currency") == BASE_CURRENCY:
+                return row
+        return None
+
+    def cash(self) -> float:
+        """可用美元。多币种账户读 USD 那一行的 buying_power；否则退回总额字段。"""
         b = self.balance()
+        row = self._currency_row(b)
+        if row is not None:
+            return max(float(row.get("buying_power") or 0), 0.0)
+        for key in ("buying_power", "total_cash_balance", "cash_balance"):
+            if b.get(key) not in (None, ""):
+                return float(b[key])
+        return 0.0
+
+    def equity(self) -> float:
+        """美元权益。多币种账户 = USD 现金 + USD 市值；否则退回总额字段。"""
+        b = self.balance()
+        row = self._currency_row(b)
+        if row is not None:
+            return float(row.get("cash_balance") or 0) + float(row.get("market_value") or 0)
         for key in ("total_net_liquidation_value", "net_liquidation_value", "total_asset"):
             if b.get(key) not in (None, ""):
                 return float(b[key])
         return float(b.get("total_cash_balance", 0)) + float(b.get("total_market_value", 0))
-
-    def cash(self) -> float:
-        b = self.balance()
-        for key in ("total_cash_balance", "cash_balance", "buying_power"):
-            if b.get(key) not in (None, ""):
-                return float(b[key])
-        return 0.0
 
     def positions(self) -> dict[str, dict]:
         """{symbol: {quantity, cost_price, last_price}}，只保留股票。"""
@@ -153,6 +177,14 @@ class WebullClient:
                 if leg.get("symbol"):
                     syms.add(leg["symbol"])
         return syms
+
+    def open_orders(self) -> list[dict]:
+        return _unwrap_list(_json(self.trade.order_v3.list_order_open(self.account_id)))
+
+    def order_history(self, days: int = 7) -> list[dict]:
+        from datetime import date, timedelta
+        start = str(date.today() - timedelta(days=days))
+        return _unwrap_list(_json(self.trade.order_v3.get_order_history(self.account_id, page_size=100, start_date=start)))
 
     # ---------------- 下单 ----------------
     def preview_order(self, order: dict) -> Any:

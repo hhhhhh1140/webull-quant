@@ -58,6 +58,7 @@ cp .env.example .env                          # 在本地编辑器里填写密�
 #    然后在 Claude Code 里输入 /trade-review —— Claude 审核并写 decisions.json
 .venv/bin/python -m wquant execute    # 读审核结论 → 风控 → 下单
 .venv/bin/python -m wquant status     # 随时查看今天的进度
+.venv/bin/python -m wquant orders     # 查看本系统在 Webull 下的订单
 
 # 5. 在沙盒里真正下单：把 config.yaml 的 mode 改成 webull（或命令加 --mode webull）
 ```
@@ -71,6 +72,31 @@ cp .env.example .env                          # 在本地编辑器里填写密�
 .venv/bin/python -m wquant scan --source synthetic --mode paper
 ```
 
+## 市场研判与对冲
+
+每天审核时，Claude 先写一份**市场研判**（偏多 / 中性 / 偏空 + 置信度 + 依据 + 未来关键事件），再审核个股。依据包括：
+
+- 程序计算的情绪指标（写在候选包的 `sentiment` 里）：市场广度及其 5 日变化、各板块广度、指数位置、Webull 板块涨跌家数、大单资金流向
+- 网上搜索的消息面：宏观数据、美联储、AI 资本开支、出口管制、龙头财报、政策
+
+研判的权限由代码限死，**只能让系统更保守**：
+
+| 研判 | 效果 |
+|---|---|
+| 偏空 | 拦截所有做多买入（反向 ETF 除外） |
+| 偏空且置信度 ≥ 0.7 | 允许提议对冲：只限 `hedge.instruments` 名单（默认 SOXS），金额 ≤ 本金 3%，最多持有 10 天，ATR 止损，研判转向后自动平仓 |
+| 中性 / 偏多 | 不放宽任何规则 |
+
+每天的研判都记在 `decisions/<日期>/decisions.json` 和日志里，仪表盘显示历史，方便事后检验判断准不准。**这部分没法回测**（模型知道历史），只能靠前向记录检验。
+
+## 仪表盘
+
+```bash
+.venv/bin/python -m wquant dashboard      # 打开 http://127.0.0.1:8765
+```
+
+只在本机监听，只读，不会下单。显示：系统权益曲线、持仓盈亏和止损位、每天的候选和 Claude 审核理由、Webull 订单、规则层回测和基准对比。每 60 秒自动刷新；权益每 10 分钟记录一次（仪表盘开着时才会记录）。
+
 ## 关于审核层能不能回测
 
 **不能可靠地回测。** Claude 的训练数据里已经包含了这些历史行情和新闻，拿它去"回测" 2023 年的决策，等于让它看着答案考试，结果会严重高估。所以：
@@ -83,11 +109,11 @@ cp .env.example .env                          # 在本地编辑器里填写密�
 
 ## 定时运行
 
-日线策略每天跑一次就够。建议美东时间 9:45（开盘 15 分钟后），用前一天的收盘数据下 DAY 限价单。
+日线策略每天跑一次就够。建议美东时间 9:45（开盘 15 分钟后；北京时间冬令时 22:45、夏令时 21:45），用前一天的收盘数据下 DAY 限价单。
 
 审核需要 Claude Code 参与，有两种方式：
 - **手动**：每天打开 Claude Code，输入 `/trade-review`
-- **自动**：在 Claude 桌面应用里建一个定时任务（工作日北京时间 22:45），内容是"在 ~/webull-quant 运行 /trade-review"。沙盒环境下它会一路执行到下单；实盘环境下它只写决策，最后一步由你自己运行
+- **自动**：在 Claude 桌面应用里建一个定时任务（工作日北京时间 22:45，美国夏令时期间改为 21:45），内容是"在 ~/webull-quant 运行 /trade-review"。沙盒环境下它会一路执行到下单；实盘环境下它只写决策，最后一步由你自己运行
 
 ## 主要配置（config.yaml）
 
@@ -96,6 +122,9 @@ cp .env.example .env                          # 在本地编辑器里填写密�
 | `risk.max_position_pct` | 0.10 | 单只股票最多占总资产的比例 |
 | `risk.max_order_notional` | 5000 | 单笔订单金额上限，会和上一项一起生效，取较小值 |
 | `risk.max_daily_loss_pct` | 0.03 | 当日亏损超过这个比例就停止开新仓 |
+| `strategy.market_filter` | SPY/QQQ 对 SMA200 | 任一指数跌破均线就停止开新仓，只执行卖出和止损 |
+| `risk.max_capital` | 100000 | 系统可动用的本金上限（美元） |
+| `order.trading_session` | ALL_DAY | 交易时段；非常规时段自动用限价单 |
 | `ai.mode` | claude_code | 审核方式，见上表 |
 | `ai.min_confidence` | 0.6 | 批准买入时的最低置信度 |
 | `order.type` | LIMIT | 限价单，价格 = 最新价 ± `limit_offset_bps` |

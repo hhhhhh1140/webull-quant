@@ -1,15 +1,21 @@
 # ===== webull-quant 配置 =====
 
-# 交易标的池（同时作为下单白名单，池外股票一律拒绝）
+# 交易标的池，按板块分组（同时作为下单白名单，池外股票一律拒绝）
+# 同一板块最多同时持有 risk.max_per_group 只，避免高度相关的股票一起买满
 universe:
-  - SPY
-  - QQQ
-  - AAPL
-  - MSFT
-  - NVDA
-  - AMZN
-  - GOOGL
-  - META
+  index:     [SPY, QQQ]
+  megacap:   [AAPL, MSFT, NVDA, AMZN, GOOGL, META]
+  semis:     [AMD, AVGO, TSM]
+  memory:    [MU, WDC, STX, SNDK]          # 存储
+  optical:   [COHR, LITE, FN, CIEN, AAOI]  # 光模块 / 光通信
+  semis_3x:  [SOXL]                        # 3 倍做多半导体
+  semis_3x_short: [SOXS]                   # 3 倍做空半导体
+  defensive: [KO, MCD]
+
+# 杠杆 / 反向 ETF：仓位按杠杆倍数缩小；反向 ETF 不受大盘过滤限制（大盘越弱越可能有信号）
+instruments:
+  SOXL: {leverage: 3}
+  SOXS: {leverage: 3, inverse: true}
 
 # 执行模式:
 #   dry_run  - 只打印决策和订单，不调用下单接口
@@ -31,6 +37,23 @@ strategy:
   atr_period: 14
   atr_stop_mult: 2.5       # 跟踪止损 = 最高收盘价 - N * ATR
   exit_below_fast_sma: true
+  # 反向 ETF（instruments 里 inverse: true）专用的短线规则
+  # 回测（2022-2026）里这套规则是亏的：23 笔、胜率 17%、合计 -1,453。先在沙盒里前向观察，实盘前建议关掉
+  inverse_rule:
+    enabled: true              # false = 不再买入反向 ETF（已有持仓仍按规则卖出）
+    sma_fast: 20
+    sma_slow: 50
+    momentum_lookback: 10
+    rsi_max_entry: 80
+    atr_stop_mult: 2.0         # 比普通股票更紧
+    max_hold_days: 15          # 杠杆 ETF 每天重置会损耗，持有满 15 个交易日强制卖出
+    require_weak_index: true   # 至少一个大盘指数跌破 SMA50 才允许买入
+  # 大盘趋势过滤：基准指数跌破长期均线时停止开新仓，只执行卖出和止损
+  market_filter:
+    enabled: true
+    symbols: [SPY, QQQ]
+    ma: sma_slow             # sma_slow = SMA200（长期趋势）；sma_fast = SMA50（更敏感）
+    mode: any                # any = 任一指数走弱就停；all = 全部走弱才停
 
 # ---- 审核层 ----
 ai:
@@ -46,20 +69,46 @@ ai:
   api_model: claude-opus-5-5
   api_effort: high
 
+# ---- 情绪指标（scan 时计算，写进候选包）----
+sentiment:
+  sectors: [Semiconductor, Software, Technology]   # Webull 板块涨跌家数，按名称关键字匹配
+  flow_symbols: [QQQ, SOXL, SOXS]                  # 看大单资金流向的标的
+
+# ---- 对冲：Claude 市场研判偏空时可以开的小额对冲仓位（不需要均线信号）----
+hedge:
+  enabled: true
+  instruments: [SOXS]          # 只允许这些标的做对冲，而且必须在标的池里
+  min_confidence: 0.7          # 研判为 risk_off 且置信度 ≥ 这个值才允许
+  max_position_pct: 0.03       # 单个对冲仓位最多占本金 3%（名义金额，不再按杠杆缩小）
+  max_hold_days: 10            # 最多持有 10 个交易日
+  atr_stop_mult: 2.0           # ATR 跟踪止损
+  exit_when_view_changes: true # 最新研判不再是 risk_off 时卖出
+
 # ---- 风控层（对所有模式生效，包括回测）----
 risk:
   max_position_pct: 0.10       # 单只股票最多占总资产 10%
-  max_positions: 6             # 最多同时持仓数
+  max_positions: 8             # 最多同时持仓数
+  max_per_group: 2             # 同一板块最多同时持有几只
   max_order_notional: 5000     # 单笔订单金额上限（美元）
   max_daily_loss_pct: 0.03     # 当日亏损超过 3% 停止开新仓
   cash_buffer_pct: 0.05        # 保留 5% 现金
   min_order_notional: 100      # 低于此金额的订单忽略
+  # 系统可动用的本金上限（美元）。共享沙盒账户里有上千万虚拟资金，按这个数来算仓位才贴近真实
+  max_capital: 100000
+  # 只管理系统自己买入的持仓；账户里手动买的或别人的股票一律不碰
+  manage_only_own_positions: true
 
 # ---- 订单 ----
 order:
   type: LIMIT                  # LIMIT 或 MARKET
   limit_offset_bps: 20         # 限价相对最新价的偏移（买入加价 / 卖出减价），单位 bp
   time_in_force: DAY
+  # 交易时段: CORE = 常规时段 9:30-16:00 ET
+  #          ALL = 盘前+常规+盘后 4:00-20:00 ET
+  #          NIGHT = 夜盘 20:00-4:00 ET
+  #          ALL_DAY = 24 小时（周一到周五）
+  # 非 CORE 时段一律用限价单（自动强制）。夜盘流动性差、价差大，成交价可能不理想
+  trading_session: ALL_DAY
 
 # ---- 回测 ----
 backtest:

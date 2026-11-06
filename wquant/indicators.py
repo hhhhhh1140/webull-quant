@@ -31,4 +31,10 @@ def add_indicators(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     out["atr"] = atr(out, p.get("atr_period", 14))
     lb = p.get("momentum_lookback", 20)
     out["momentum"] = out["close"] / out["close"].shift(lb) - 1
+    # 反向 ETF 短线规则用的指标
+    r = p.get("inverse_rule") or {}
+    out["st_fast"] = sma(out["close"], r.get("sma_fast", 20))
+    out["st_slow"] = sma(out["close"], r.get("sma_slow", 50))
+    slb = r.get("momentum_lookback", 10)
+    out["st_mom"] = out["close"] / out["close"].shift(slb) - 1
     return out

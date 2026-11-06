@@ -18,6 +18,9 @@ from .risk import OrderIntent
 def build_webull_order(intent: OrderIntent, order_cfg: dict) -> dict:
     """订单格式与官方 webull-openapi-mcp 的 _build_stock_order 一致。"""
     otype = order_cfg.get("type", "LIMIT").upper()
+    session = order_cfg.get("trading_session", "CORE").upper()
+    if session != "CORE":
+        otype = "LIMIT"   # 盘前盘后/夜盘流动性差，只允许限价单
     order = {
         "combo_type": "NORMAL",
         "client_order_id": uuid.uuid4().hex[:32],
@@ -26,7 +29,7 @@ def build_webull_order(intent: OrderIntent, order_cfg: dict) -> dict:
         "symbol": intent.symbol,
         "order_type": otype,
         "entrust_type": "QTY",
-        "support_trading_session": "CORE",
+        "support_trading_session": session,
         "time_in_force": order_cfg.get("time_in_force", "DAY"),
         "side": intent.side,
         "quantity": str(int(intent.quantity)),
