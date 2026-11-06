@@ -29,6 +29,21 @@ class Decision(BaseModel):
     key_risks: list[str] = []
 
 
+class MarketView(BaseModel):
+    regime: Literal["risk_on", "neutral", "risk_off"] = Field(description="偏多 / 中性 / 偏空")
+    confidence: float = Field(ge=0, le=1)
+    summary: str
+    drivers: list[str] = []
+    catalysts: list[str] = []
+
+
+class HedgeProposal(BaseModel):
+    symbol: str
+    conviction: float = Field(ge=0, le=1)
+    reasoning: str
+    key_risks: list[str] = []
+
+
 REVIEW_GUIDE = """你是一个美股日线级别交易系统里的风险审核员。
 
 规则引擎已经根据技术面筛出了交易候选。你的工作是结合价格结构、近期新闻和持仓情况，

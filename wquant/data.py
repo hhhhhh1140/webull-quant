@@ -18,8 +18,13 @@ def _cache_path(symbol: str) -> Path:
 
 
 def save_cache(symbol: str, df: pd.DataFrame) -> None:
+    """与已有缓存合并（新数据覆盖重叠日期），不会因为这次拉得少就截短历史。"""
     CACHE.mkdir(parents=True, exist_ok=True)
-    df.to_csv(_cache_path(symbol), index_label="date")
+    p = _cache_path(symbol)
+    if p.exists():
+        old = load_csv(p)
+        df = pd.concat([old[~old.index.isin(df.index)], df]).sort_index()
+    df.to_csv(p, index_label="date")
 
 
 def load_csv(path: str | Path) -> pd.DataFrame:

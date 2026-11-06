@@ -5,7 +5,7 @@
 ## 每日流程
 
 1. `python -m wquant scan` → 规则层生成 `decisions/<日期>/candidates.json`
-2. Claude Code 审核（`/trade-review` 技能）→ 写 `decisions/<日期>/decisions.json`
+2. Claude Code 审核（`/trade-review` 技能）→ 先写市场研判和对冲提议，再审核个股 → `decisions/<日期>/decisions.json`
 3. `python -m wquant execute` → 风控 → 下单 → `logs/<日期>.jsonl`
 
 所有命令都用 `.venv/bin/python -m wquant ...`。
