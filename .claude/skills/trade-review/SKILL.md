@@ -20,9 +20,16 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
 2. **读取** `decisions/<今天日期>/candidates.json`。重点字段：
    - `market`：均线大盘过滤。`risk_off: true` 时程序已拦截做多买入（见 `blocked_buys`）
    - `sentiment`：广度（`breadth.above_sma50` 及 5 日变化）、各板块广度 `by_group`、指数位置 `indices`、板块涨跌家数 `sectors`、大单资金流 `capital_flow`、恐惧贪婪 `fear_greed`（沙盒可能为空）
-   - `last_market_view`：上一次你写的研判，判断有没有变化
+   - `last_market_view`：上一次你写的研判（含当时的 `event_scenarios`），判断有没有变化
+   - `events`：未来 7 天和过去 3 天的事件（`released` 表示是否已公布）。财报来自 Webull，宏观事件来自 `events.yaml`
+   - `event_restrictions_at_scan`：按 scan 时间算出的开仓限制（execute 时会按当时时间重新计算）
    - `hedge_rules` / `hedge_quotes`：对冲规则、可用对冲工具的价格结构、当前已有的对冲
-3. **市场研判（必做，先于个股）**：
+3. **维护事件日历 `events.yaml`**（宏观事件；财报不用管）：
+   - 用 WebSearch 查未来 7 天的重大宏观事件：CPI、PPI、非农、FOMC 决议和会议纪要、PCE、GDP、重要的美联储官员讲话
+   - 没有的就加上，日期、美东时间、市场预期（`consensus`）和来源链接都要写；只有真正会影响大盘的才标 `importance: high`
+   - 已经公布的事件，把实际值补到 `actual`
+   - 查不到确切日期就不要写，不要猜
+4. **市场研判（必做，先于个股）**：
    - 用 WebSearch 查最近 1-3 天的大事：美联储 / 利率、CPI 等宏观数据、AI 资本开支和融资、出口管制、龙头财报（NVDA、TSM、MU 等）、地缘事件
    - 用 WebSearch 查未来 5 个交易日的关键日程（FOMC、CPI、大公司财报）
    - 和情绪指标交叉验证。下面是**参考**，不是机械规则：
@@ -31,12 +38,16 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
      - 消息面和价格背离（坏消息不跌 / 好消息不涨）要特别指出
    - 给出 `regime`（risk_on / neutral / risk_off）、`confidence`、一句话 `summary`、`drivers`（依据）、`catalysts`（未来几天的关键事件）
    - **如实写置信度**：信号矛盾、消息不明确时用 neutral 或较低置信度。不要为了开对冲而抬高置信度
-4. **对冲提议（可选）**：只有同时满足以下条件才提：
+   - **事件前推演** `event_scenarios`：未来 48 小时内还没公布的 high 事件，每个写三种情景（强于预期 / 符合预期 / 弱于预期）：
+     触发条件（具体数字）、市场可能的反应、系统怎么应对。不要预测具体数字，市场预期和 nowcast 比你准；你的价值在于想清楚各种情况下怎么办
+   - **事件后复盘** `event_reviews`：上次研判之后公布的事件，写实际值、市场实际反应、命中了哪个情景、有什么教训。
+     对照 `last_market_view.event_scenarios` 如实写，推演错了就写错了
+5. **对冲提议（可选）**：只有同时满足以下条件才提：
    - 你的研判是 `risk_off`，并且置信度 ≥ `hedge_rules.min_confidence`
    - 标的在 `hedge_rules.instruments` 里，且当前没有持有（`hedge_quotes[x].held` 为 false）
    - 看 `hedge_quotes` 的价格结构：对冲工具已经暴涨很多（如 20 日 +80% 以上）、RSI 超过 75 时，大概率错过了最好的时点，要么不提，要么把 conviction 压低
    - 金额 = 本金 × `max_position_pct` × conviction，最多持有 `max_hold_days` 天；你的研判转为非 risk_off 时程序会自动平仓
-5. **逐个审核候选**：
+6. **逐个审核候选**：
    - 看 `price_summary`：趋势是否健康、离 52 周高点多远、近 5 日是否暴涨暴跌、ATR 相对价格是否异常
    - 看 `news`：有没有重大负面、诉讼、监管、管理层变动、指引下调（沙盒没有新闻接口，需要时用 WebSearch）
    - 必要时用 WebSearch 查**财报日期**（财报前 5 个交易日内的买入，默认降低 conviction 或否决）
@@ -47,7 +58,7 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
      已经暴涨、RSI 接近 80 时多半是追高，应该否决或把 conviction 压到 0.3 以下
    - `has_open_order: true` 的候选程序会自动跳过，照常给结论即可
    - 卖出（止损）信号：`ai_rules.can_veto_exits` 为 false 时你的否决不会生效，一般直接 APPROVE，在 reasoning 里说明原因
-6. **写入** `decisions/<今天日期>/decisions.json`，格式严格如下：
+7. **写入** `decisions/<今天日期>/decisions.json`，格式严格如下：
 
 ```json
 {
@@ -58,7 +69,21 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
     "confidence": 0.75,
     "summary": "一句话结论",
     "drivers": ["依据 1（附数据或新闻来源）", "依据 2"],
-    "catalysts": ["11/12 CPI", "11/19 NVDA 财报"]
+    "catalysts": ["11/12 CPI", "11/19 NVDA 财报"],
+    "event_scenarios": [
+      {
+        "event": "10 月 CPI（11/10 08:30 ET）",
+        "consensus": "整体 3.7% / 核心 2.5%",
+        "scenarios": [
+          {"name": "强于预期", "condition": "整体 ≥3.9% 或核心 ≥2.7%", "expected_reaction": "加息预期升温，科技股承压", "system_response": "维持偏空，不开新多仓"},
+          {"name": "符合预期", "condition": "整体 3.6-3.8%", "expected_reaction": "影响有限", "system_response": "按原计划"},
+          {"name": "弱于预期", "condition": "整体 ≤3.5%", "expected_reaction": "利率下行，超跌科技股反弹", "system_response": "考虑把研判调回 neutral，平掉对冲"}
+        ]
+      }
+    ],
+    "event_reviews": [
+      {"event": "10 月非农（11/6）", "actual": "+XXK，失业率 X.X%", "market_reaction": "开盘后 QQQ ±X%", "matched_scenario": "符合预期", "lesson": "一句话"}
+    ]
   },
   "hedges": [
     {"symbol": "SOXS", "conviction": 0.6, "reasoning": "为什么对冲、为什么是现在", "key_risks": ["V 型反弹风险"]}
@@ -77,12 +102,12 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
 ```
 
    - `date` 必须是今天，和 candidates.json 一致，否则程序拒绝执行
-   - `market_view` 每天都要写；`hedges` 没有就写空数组
+   - `market_view` 每天都要写；`hedges`、`event_scenarios`、`event_reviews` 没有就写空数组
    - 所有 0-1 的字段不能越界；买入的 confidence 低于 `ai_rules.min_confidence` 时不会执行
    - 每个候选都要有一条；漏掉的买入会被当作否决
 
-7. **向用户汇报**：先说市场研判（结论、置信度、两三条主要依据、未来关键事件），再列对冲提议，最后用一张表列出 股票 / 信号 / 结论 / 置信度 / 仓位系数 / 一句话理由。附上引用的新闻链接。
-8. **执行**：
+8. **向用户汇报**：先说市场研判（结论、置信度、两三条主要依据、未来关键事件），有事件时说清楚推演和复盘，再列对冲提议，最后用一张表列出 股票 / 信号 / 结论 / 置信度 / 仓位系数 / 一句话理由。附上引用的新闻链接。
+9. **执行**：
    - `environment` 是 `uat`，或 `mode` 是 `dry_run` / `paper`：可以运行 `.venv/bin/python -m wquant execute`，把输出告诉用户
    - `environment` 是 `prod`：**不要运行 execute**。把命令交给用户自己运行：`.venv/bin/python -m wquant execute --confirm-live`
 

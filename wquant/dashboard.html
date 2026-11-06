@@ -190,6 +190,15 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
     </div>
   </div>
 
+  <div class="card" style="margin-bottom:14px">
+    <h2>事件日历</h2>
+    <div class="sub" id="evSub">宏观事件（events.yaml）+ 财报（Webull）；重大事件公布前新开仓位减半，财报前 3 个交易日不买该股票</div>
+    <div class="view">
+      <div class="scroll" id="evList"></div>
+      <div id="evPlans"></div>
+    </div>
+  </div>
+
   <div class="grid two">
     <div class="card">
       <h2>系统权益</h2>
@@ -384,7 +393,7 @@ function renderPositions(a) {
 const OUTCOME = {
   submitted: "已提交到 Webull", filled: "已成交（本地模拟）", dry_run: "dry run，未下单",
   rejected_by_review: "审核否决，未下单", rejected_by_ai: "审核否决，未下单",
-  rejected_by_risk: "风控拦截", error: "下单失败", rejected: "被拒绝", hedge_rejected: "未执行",
+  rejected_by_risk: "风控拦截", error: "下单失败", rejected: "被拒绝", hedge_rejected: "未执行", rejected_by_event: "财报前不开仓",
 };
 
 function renderDecisions(days) {
@@ -479,10 +488,45 @@ function renderView(days) {
   $("viewSentiment").innerHTML = h;
 }
 
+function fmtConsensus(c) {
+  if (!c) return "—";
+  if (typeof c === "string") return esc(c);
+  return Object.entries(c).filter(([, v]) => v != null && v !== "").map(([k, v]) => {
+    const n = parseFloat(v);
+    const val = k === "revenue" && !isNaN(n) ? "$" + (n / 1e9).toFixed(1) + "B" : k === "eps" && !isNaN(n) ? n.toFixed(2) : v;
+    return `${esc(k)}: ${esc(val)}`;
+  }).join("<br>");
+}
+function renderEvents(evd, days) {
+  if (!evd) { $("evList").innerHTML = ""; $("evPlans").innerHTML = ""; return; }
+  const r = evd.restrictions || {};
+  const notes = (r.reasons || []).concat(Object.entries(r.blocked || {}).map(([s, why]) => `${s}：${why}`));
+  $("evSub").innerHTML = notes.length ? `<b>当前生效的限制：</b>${notes.map(esc).join("；")}` :
+    "宏观事件（events.yaml）+ 财报（Webull）。当前没有生效的开仓限制";
+  const items = evd.items || [];
+  $("evList").innerHTML = items.length ? `<table><thead><tr><th>美东时间</th><th>事件</th><th>预期</th><th>状态</th></tr></thead><tbody>${
+    items.map((e) => `<tr style="${e.released ? "color:var(--text-muted)" : ""}"><td>${esc(e.date.slice(5))} ${esc(e.time_et || "")}</td>
+      <td>${esc(e.name)}${e.importance === "high" ? "" : ' <span class="meta">(次要)</span>'}</td>
+      <td style="white-space:normal;font-size:12px">${fmtConsensus(e.consensus)}</td>
+      <td>${e.released ? (e.actual ? "已公布：" + fmtConsensus(e.actual) : "已公布") : (e.hours_until < 48 ? `<b>${Math.round(e.hours_until)} 小时后</b>` : Math.round(e.hours_until / 24) + " 天后")}</td></tr>`).join("")
+  }</tbody></table>` : '<div class="empty">未来两周没有记录的事件</div>';
+  const v = (days || []).find((d) => d.market_view);
+  const mv = v && v.market_view;
+  let h = "";
+  (mv?.event_scenarios || []).forEach((es) => {
+    h += `<h3 style="margin-top:0">事件推演：${esc(es.event)}</h3><div class="meta">预期：${esc(es.consensus || "")}</div><ul>` +
+      (es.scenarios || []).map((s) => `<li><b>${esc(s.name)}</b>（${esc(s.condition)}）：${esc(s.expected_reaction)} → ${esc(s.system_response)}</li>`).join("") + "</ul>";
+  });
+  (mv?.event_reviews || []).forEach((er) => {
+    h += `<h3>事件复盘：${esc(er.event)}</h3><div class="meta">实际：${esc(er.actual)} · 反应：${esc(er.market_reaction)} · 命中情景：${esc(er.matched_scenario)}</div>${er.lesson ? `<p class="reason">${esc(er.lesson)}</p>` : ""}`;
+  });
+  $("evPlans").innerHTML = h || '<div class="empty">还没有事件推演。重大事件前一天的 /trade-review 会写三种情景和应对</div>';
+}
+
 let last = null;
 function renderAll(d) {
   last = d;
-  renderHeader(d); renderView(d.decisions); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
+  renderHeader(d); renderView(d.decisions); renderEvents(d.events, d.decisions); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
   renderPositions(d.account); renderDecisions(d.decisions); renderOrders(d.account); renderBacktest(d.backtest);
 }
 

@@ -84,6 +84,13 @@ hedge:
   atr_stop_mult: 2.0           # ATR 跟踪止损
   exit_when_view_changes: true # 最新研判不再是 risk_off 时卖出
 
+# ---- 事件日历（宏观事件见 events.yaml，财报日期自动从 Webull 获取）----
+events:
+  enabled: true
+  lookahead_hours: 24          # 重大宏观事件在这么多小时内公布（尚未公布）时……
+  pre_event_size_factor: 0.5   # ……新开仓位乘这个系数（不影响卖出和对冲）
+  earnings_blackout_days: 3    # 某只股票在几个交易日内发财报时，不买入这只
+
 # ---- 风控层（对所有模式生效，包括回测）----
 risk:
   max_position_pct: 0.10       # 单只股票最多占总资产 10%

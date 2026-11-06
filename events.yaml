@@ -1,0 +1,25 @@
+# 宏观事件日历。Claude 每天审核时用网上搜索维护（新增事件、更新市场预期、补实际值）。
+# 财报日期不用写在这里，程序会从 Webull 自动获取。
+#
+# 字段：
+#   date        美东日期 YYYY-MM-DD
+#   time_et     美东时间 "08:30" / "14:00"，或 BMO（盘前）/ AMC（盘后）
+#   name        名称
+#   importance  high / medium（只有 high 会触发开仓限制）
+#   consensus   市场预期（自由格式）
+#   actual      公布后的实际值（复盘时补上）
+#   source      预期的来源链接
+events:
+  - date: 2026-11-06
+    time_et: "08:30"
+    name: 10 月非农就业报告
+    importance: high
+    consensus: {nonfarm_payrolls: "+65K（FactSet 中位数，区间 50K-125K；道琼斯 59K）", unemployment_rate: "4.2%", prior: "+29K"}
+    source: https://insight.factset.com/total-nonfarm-payrolls-for-october-2026-are-projected-to-rise-by-65000
+  - date: 2026-11-10
+    time_et: "08:30"
+    name: 10 月 CPI
+    importance: high
+    consensus: {headline_yoy: "3.74%（克利夫兰联储 nowcast，11/05）", core_yoy: "2.48%（nowcast）", prior: "整体 3.7% / 核心 2.6%", prediction_market: "同比 3.7% 约 92%"}
+    source: https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting
+  # FOMC：尚未查到 2026 年 11-12 月会议日期，确认后补上
