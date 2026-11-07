@@ -10,3 +10,4 @@ webull_*_sdk.log
 KILL_SWITCH
 decisions/
 .DS_Store
+data/intraday/

@@ -8,8 +8,7 @@ universe:
   semis:     [AMD, AVGO, TSM]
   memory:    [MU, WDC, STX, SNDK]          # 存储
   optical:   [COHR, LITE, FN, CIEN, AAOI]  # 光模块 / 光通信
-  semis_3x:  [SOXL]                        # 3 倍做多半导体
-  semis_3x_short: [SOXS]                   # 3 倍做空半导体
+  # SOXL / SOXS 由半导体波段系统（下面的 swing）专门管理，不放在选股池里，避免两套系统交易同一只
   defensive: [KO, MCD]
 
 # 杠杆 / 反向 ETF：仓位按杠杆倍数缩小；反向 ETF 不受大盘过滤限制（大盘越弱越可能有信号）
@@ -76,7 +75,7 @@ sentiment:
 
 # ---- 对冲：Claude 市场研判偏空时可以开的小额对冲仓位（不需要均线信号）----
 hedge:
-  enabled: true
+  enabled: false               # 做空一侧改由 swing 战术层负责（回测验证过），这里关闭避免重复
   instruments: [SOXS]          # 只允许这些标的做对冲，而且必须在标的池里
   min_confidence: 0.7          # 研判为 risk_off 且置信度 ≥ 这个值才允许
   max_position_pct: 0.03       # 单个对冲仓位最多占本金 3%（名义金额，不再按杠杆缩小）
@@ -123,3 +122,63 @@ backtest:
   commission_per_trade: 0.0
   slippage_bps: 5
   bars: 1200                   # Webull 单次最多 1200 根日线（约 4.7 年）
+
+# ===== 半导体短线系统（SOXL / SOXS）=====
+# 战术层：夜盘 4 个检查时点，SOXL 相对昨收 ≥±3% 且 KOSPI 综合指数同方向 ≥1% → 当天顺势买 SOXL / SOXS，
+#         仓位按信号强弱 33%～66%；盘前 / 常规时段盈利加仓到 130%；止损 6%、加仓后回撤 6% 止盈，卖出后反弹 3% 买回（不限次数）；
+#         收盘前平仓，不持仓过夜；方向再由 Claude 每天的市场研判过滤（这一层没法回测）。
+# 核心层：日线长周期只做多。现在不是牛市，先关闭。
+swing:
+  core:
+    enabled: false
+    index: SOXX
+    long: SOXL
+    allocation: 0.30
+    rebalance_band: 0.05
+  tactical:
+    enabled: true
+    checkpoints: ["21:00", "23:00", "01:30", "04:00"]   # 美东时间；北京冬令时 10:00 / 12:00 / 14:30 / 17:00
+    exit: "15:55"            # 北京冬令时 04:55
+    threshold: 0.03          # SOXL 相对昨收涨跌 ≥3%
+    korea: KOSPI
+    korea_confirm: 0.01      # KOSPI 当天同方向 ≥1%
+    capital: 3000            # 系统本金（独立记账，和沙盒账户里的几千万虚拟资金无关）
+    position_frac: 0.33      # 固定仓位模式（sizing.mode: fixed）时用
+    stop_pct: 0.06           # 软件止损：跌破持仓均价 6%
+    reentry: true
+    rebound_pct: 0.03        # 卖出（止损 / 止盈）后从最低点反弹 3% 就按原方向买回
+    max_reentries: null      # 一天买回次数：null = 不限
+    last_reentry: "15:00"
+    # 融资与盈利加仓：夜盘不能融资（最多 100%）；盘前 / 常规时段最多 130%（需要账户对 SOXL/SOXS 有融资额度）
+    max_frac_ovn: 1.0
+    max_frac: 1.3
+    add_step: 0.03           # 比上一次买入价再涨 3% 就加仓
+    add_frac: 0.33           # 每次加 33% 权益
+    add_from: "04:00"        # 盘前开始才加仓（北京冬令时 17:00）
+    add_last: "15:00"        # 15:00 ET 以后不再加仓
+    trail_after_add: 0.06    # 加过仓后，从持仓最高价回撤 6% 全部卖出（之后反弹 3% 再买回）
+    # 回测（124 天，本金 3000）：+184%，最大回撤 -18%，最差一天 -11.7%；夜盘滑点按 0.3% 算是 +160%
+    poll_seconds: 60
+    sides: [long, short]
+    view_gate: true          # 用 Claude 当天的市场研判过滤方向
+    view_min_confidence: 0.7 # 研判置信度达到这个值才限制方向
+    # 动态仓位 = 33% × 信号强弱倍数，限制在 15%～80%
+    #   信号强弱倍数 = min(SOXL 涨跌 / 3%, KOSPI 涨跌 / 1%)，在 1～signal_cap 之间（全部用当天实时数据，没有滞后）
+    #   趋势效率（过去 10 天）有 4～6 天滞后、而且会压缩趋势反转时的交易，已关闭（use_trend_efficiency: false）
+    #   回测（124 天）：平均仓位 50%，+101%，最大回撤 -12.2%（固定 33%：+51% / -9.6%）
+    #   改成 mode: fixed 就回到固定 position_frac
+    sizing:
+      mode: dynamic
+      base: 0.33
+      signal_cap: 2.0
+      use_trend_efficiency: false
+      trend_index: SOXX
+      er_window: 10
+      er_tiers: [[0.2, 0.6], [0.4, 1.0], [99, 1.3]]
+      min: 0.15
+      max: 0.80
+  order:
+    type: LIMIT
+    limit_offset_bps: 30     # 限价 = 最新价 ± 0.3%（夜盘 / 盘前价差大）
+    time_in_force: DAY
+    trading_session: ALL_DAY

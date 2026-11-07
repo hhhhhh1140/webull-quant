@@ -191,6 +191,15 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
   </div>
 
   <div class="card" style="margin-bottom:14px">
+    <h2>半导体短线系统（SOXL / SOXS）</h2>
+    <div class="sub">夜盘 4 个时点：SOXL 相对昨收 ≥±3% 且 KOSPI 同方向 ≥1% → 当天顺势，止损 6%，收盘前平仓；方向由每日市场研判过滤</div>
+    <div class="view">
+      <div id="swCore"></div>
+      <div id="swTac"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
     <h2>事件日历</h2>
     <div class="sub" id="evSub">宏观事件（events.yaml）+ 财报（Webull）；重大事件公布前新开仓位减半，财报前 3 个交易日不买该股票</div>
     <div class="view">
@@ -523,10 +532,38 @@ function renderEvents(evd, days) {
   $("evPlans").innerHTML = h || '<div class="empty">还没有事件推演。重大事件前一天的 /trade-review 会写三种情景和应对</div>';
 }
 
+function renderSwing(sw) {
+  if (!sw) { $("swCore").innerHTML = ""; $("swTac").innerHTML = ""; return; }
+  const c = sw.core, cfg = sw.config || {};
+  const books = sw.books || {};
+  const bookTxt = (b) => Object.entries(books[b] || {}).map(([s, q]) => `${esc(s)} ${q} 股`).join("，") || "空仓";
+  const eq = sw.equity || {}, cap = eq.capital || 3000, ret = (eq.equity || cap) / cap - 1;
+  let h = `<h3 style="margin-top:0">系统权益（独立记账）</h3>
+    <div class="value" style="font-size:24px;font-weight:650">${fmtUsd(eq.equity, 2)} <span class="${signCls(ret)}" style="font-size:13px">${fmtPct(ret, 2)}</span></div>
+    <div class="meta">本金 ${fmtUsd(cap)} · 每笔 ${((cfg.tactical?.position_frac || 0) * 100).toFixed(0)}% · 已交易 ${(eq.history || []).length} 天</div>`;
+  const hist = (eq.history || []).map((x) => ({ x: x.day, equity: x.equity }));
+  h += `<div class="chart" id="swEq" style="margin-top:8px"></div>`;
+  h += `<h3>今晚的方向限制（交易日 ${esc(sw.next_day)}）</h3><div class="meta">${esc(sw.gate || "")}</div>`;
+  h += `<h3>核心层（日线长周期）</h3>`;
+  if (c) {
+    const n = Math.round((c.weight || 0) * 3);
+    h += `<div class="hbar"><span>看多规则</span><span class="track"><i style="width:${(c.weight || 0) * 100}%"></i></span><span>${n}/3</span></div>
+      <div class="meta">${esc(cfg.core?.index || "SOXX")} 截至 ${esc(c.index_date)} · 目标 ${esc(cfg.core?.long || "SOXL")} ${c.target_qty} 股 · 上次运行 ${esc((c.ts || "").replace("T", " "))}</div>`;
+  } else h += '<div class="meta">还没运行过：.venv/bin/python -m wquant swing core</div>';
+  h += `<div class="meta">${cfg.core?.enabled === false ? "已关闭（当前不是牛市）" : "当前持仓：" + bookTxt("core")}</div>`;
+  $("swCore").innerHTML = h;
+  if (hist.length >= 2) lineChart($("swEq"), [{ x: "起点", equity: cap }, ...hist], [{ key: "equity", label: "系统权益", color: "--series-1" }], { height: 140, fmtX: (x) => x.slice(5), fmtY: (v, full) => fmtUsd(v, full ? 2 : 0) });
+  const t = sw.tactical || [];
+  let g = `<h3 style="margin-top:0">战术层每日记录</h3><div class="meta">当前持仓：${bookTxt("tactical")}</div>`;
+  g += t.length ? t.map((s) => `<div style="margin-top:8px"><b>${esc(s.day)}</b> ${s.side ? (s.side > 0 ? "做多 SOXL" : "买 SOXS") : "不做"}${s.move != null ? ` · 夜盘 ${fmtPct(s.move)}` : ""}${s.korea_move != null ? ` · 韩国 ${fmtPct(s.korea_move)}` : ""}${s.done ? ` · 盈亏 ${fmtSigned(s.pnl)}` : " · 进行中"}
+      <ul>${(s.log || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`).join("") : '<div class="empty">还没运行过战术层</div>';
+  $("swTac").innerHTML = g;
+}
+
 let last = null;
 function renderAll(d) {
   last = d;
-  renderHeader(d); renderView(d.decisions); renderEvents(d.events, d.decisions); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
+  renderHeader(d); renderView(d.decisions); renderEvents(d.events, d.decisions); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
   renderPositions(d.account); renderDecisions(d.decisions); renderOrders(d.account); renderBacktest(d.backtest);
 }
 

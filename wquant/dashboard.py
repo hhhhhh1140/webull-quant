@@ -256,9 +256,35 @@ def _events(settings: Settings) -> dict:
             "restrictions": ev.restrictions(allv, now, settings.section("events"))}
 
 
+def _swing(settings: Settings) -> dict:
+    from datetime import datetime as _dt
+    from . import swing_live as SL
+    env = settings.environment
+    books = SL.Books(env).data
+    day = SL.trading_day(_dt.now(SL.ET))
+    states = sorted(journal.STATE.glob(f"swing_tactical_{env}_*.json"))[-10:]
+    tactical = [json.loads(x.read_text()) for x in reversed(states)]
+    core = None
+    for f in sorted(journal.LOGS.glob("*.jsonl"), reverse=True):
+        for line in reversed(f.read_text(encoding="utf-8").splitlines()):
+            r = json.loads(line)
+            if r.get("event") == "swing_core":
+                core = r
+                break
+        if core:
+            break
+    eqp = SL._equity_path(env)
+    eq = json.loads(eqp.read_text()) if eqp.exists() else {"capital": SL.swing_cfg(settings)["tactical"]["capital"],
+                                                            "equity": SL.system_equity(settings), "history": []}
+    allowed, gate = SL.view_gate(settings, day)
+    return {"books": books, "next_day": str(day), "tactical": tactical, "core": core, "config": SL.swing_cfg(settings),
+            "equity": eq, "gate": gate, "allowed": sorted(allowed)}
+
+
 def collect(settings: Settings) -> dict:
     data = {"generated_at": datetime.now().isoformat(timespec="seconds"), "environment": settings.environment,
             "events": _events(settings),
+            "swing": _swing(settings),
             "market": _market(settings),
             "region": settings.region_id, "mode": settings.mode, "ai_mode": settings.section("ai").get("mode"),
             "live_trading_enabled": settings.live_trading_enabled, "universe": settings.universe,
