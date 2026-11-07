@@ -140,6 +140,97 @@ def cmd_dashboard(args, s):
     return 0
 
 
+def cmd_intraday(args, s):
+    """下载 / 更新分钟线并跑日内回测。"""
+    import pandas as pd
+    from .intraday_bt import STRATEGIES, Params, buy_hold_intraday, load_days, run, summarize
+    from .intraday_data import download, load
+    if args.fetch:
+        from .webull_client import WebullClient
+        c = WebullClient(s)
+        for sym in (args.long, args.short, args.ref):
+            df = download(c, sym, "M5")
+            print(f"{sym}: {len(df)} 根 5 分钟线，{df.index.min():%Y-%m-%d} → {df.index.max():%Y-%m-%d}")
+    days = load_days(load(args.long), load(args.short), load(args.ref))
+    if not days:
+        print("没有分钟数据，先加 --fetch")
+        return 1
+    p = Params(slippage=args.slippage / 100)
+    print(f"{len(days)} 个交易日（{days[0]['day']} → {days[-1]['day']}），滑点 {args.slippage}% 单边，每笔 ${p.notional:,.0f}，止损 {p.stop_pct:.0%}")
+    rows = {}
+    for name, fn in STRATEGIES.items():
+        tr, daily = run(days, fn, p)
+        rows[name] = summarize(tr, daily, p)
+    for key, label in (("L", f"基准：每天开盘买 {args.long}"), ("S", f"基准：每天开盘买 {args.short}")):
+        bh = buy_hold_intraday(days, key, p)
+        rows[label] = {"总盈亏": round(bh.sum()), "收益率": round(bh.sum() / p.capital, 4), "笔数": len(bh)}
+    pd.set_option("display.width", 220)
+    print(pd.DataFrame(rows).T.to_string())
+    return 0
+
+
+def cmd_overnight(args, s):
+    """夜盘方向 → 顺势持有 的跨时段回测。"""
+    from dataclasses import replace
+    from .intraday24 import P24, build_days, run24, stats
+    from .intraday_data import download, load
+    syms = (args.long, args.short, "EWY")
+    if args.fetch:
+        from .webull_client import WebullClient
+        c = WebullClient(s)
+        for sym in syms:
+            download(c, sym, "M5")
+    days = build_days(*(load(x) for x in syms))
+    if not days:
+        print("没有分钟数据，先加 --fetch")
+        return 1
+    p = P24(entry=args.entry, exit=args.exit, threshold=args.threshold / 100, stop_pct=args.stop / 100,
+            reentry=not args.no_reentry, korea_confirm=args.korea / 100 if args.korea is not None else None)
+    tr, dl = run24(days, p)
+    print(f"{len(days)} 个交易日（{days[0]['day']} → {days[-1]['day']}）")
+    print(f"{args.entry} ET 判断，{args.long} 相对昨收 ≥±{args.threshold}% 顺势，止损 {args.stop}%，"
+          f"{'可买回' if p.reentry else '不买回'}，韩国确认 {args.korea if args.korea is not None else '不看'}，{args.exit} 平仓")
+    for k, v in stats(tr, dl, p).items():
+        print(f"  {k}: {v}")
+    return 0
+
+
+def cmd_swing(args, s):
+    from datetime import datetime
+    from . import swing_live as SL
+    cfg = SL.swing_cfg(s)
+    mode = args.mode or "dry_run"
+    now = lambda: datetime.now(SL.ET)
+    books = SL.Books(s.environment)
+    if args.what == "status":
+        print(f"环境 {s.environment}  系统权益 ${SL.system_equity(s):,.2f}  账本 {books.data}")
+        day = SL.trading_day(now())
+        st = SL._load_state(s.environment, day)
+        print(f"战术层 {day}: " + ("\n  ".join(st.log) if st.log else "还没开始"))
+        return 0
+    if args.what == "backtest":
+        from .data import load_bars
+        from .swing import backtest_weight, ensemble_weight, yearly
+        B = load_bars(s, [cfg["core"]["index"], cfg["core"]["long"]], source="webull", count=1200)
+        X, L = B[cfg["core"]["index"]], B[cfg["core"]["long"]]
+        r = backtest_weight(X, L, ensemble_weight(X), allocation=cfg["core"]["allocation"], start="2022-06-01")
+        print("核心层:", r.metrics, "按年", yearly(r.equity))
+        return 0
+    from .webull_client import WebullClient
+    client = WebullClient(s)
+    md = SL.WebullMarket(client, now)
+    broker = SL.make_broker(s, mode, args.confirm_live, cfg["order"])
+    dry = mode != "webull"
+    if args.what == "core":
+        if not cfg["core"].get("enabled", True):
+            print("核心层在 config.yaml 里是关闭的（swing.core.enabled: false）")
+            return 0
+        SL.core_rebalance(s, md, broker, books, dry=dry)
+    elif args.what == "tactical":
+        SL.run_tactical_day(s, md, broker, books, now, dry=dry)
+    return 0
+
+
 def cmd_status(args, s):
     from .engine import day_dir
     d = day_dir()
@@ -190,13 +281,33 @@ def main(argv=None) -> int:
     o = sub.add_parser("orders", help="查看 Webull 账户里本系统下的订单")
     o.add_argument("--days", type=int, default=7)
     o.add_argument("--all", action="store_true", help="显示账户里所有订单（共享沙盒里包括别人的）")
+    it = sub.add_parser("intraday-bt", help="日内做 T 回测（5 分钟线，常规时段）")
+    it.add_argument("--fetch", action="store_true", help="先从 Webull 下载 / 更新最近 180 天分钟线")
+    it.add_argument("--long", default="SOXL")
+    it.add_argument("--short", default="SOXS")
+    it.add_argument("--ref", default="QQQ")
+    it.add_argument("--slippage", type=float, default=0.05, help="单边滑点（%）")
+    on = sub.add_parser("overnight-bt", help="夜盘方向 → 顺势持有 的跨时段回测")
+    on.add_argument("--fetch", action="store_true")
+    on.add_argument("--long", default="SOXL")
+    on.add_argument("--short", default="SOXS")
+    on.add_argument("--entry", default="04:00", help="美东时间，夜盘内或盘前")
+    on.add_argument("--exit", default="16:00", choices=["09:30", "16:00"])
+    on.add_argument("--threshold", type=float, default=3.0, help="相对昨收涨跌（%%）")
+    on.add_argument("--stop", type=float, default=6.0, help="止损（%%）")
+    on.add_argument("--no-reentry", action="store_true")
+    on.add_argument("--korea", type=float, default=None, help="要求 EWY 同方向至少多少（%%）")
+    sw = sub.add_parser("swing", help="半导体波段系统：core 每日调仓 / tactical 当天夜盘战术（会一直运行到收盘）/ status / backtest")
+    sw.add_argument("what", choices=["core", "tactical", "status", "backtest"])
+    sw.add_argument("--mode", choices=["dry_run", "webull"], help="默认 dry_run 只打印；webull 才下单")
+    sw.add_argument("--confirm-live", action="store_true")
     db = sub.add_parser("dashboard", help="启动本地网页仪表盘（只读）")
     db.add_argument("--port", type=int, default=8765)
 
     args = p.parse_args(argv)
     s = load_settings(args.config)
     cmds = {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
-            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard}
+            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "overnight-bt": cmd_overnight, "swing": cmd_swing}
     return cmds[args.cmd](args, s)
 
 

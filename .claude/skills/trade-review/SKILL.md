@@ -15,6 +15,8 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
 
 ## 步骤
 
+0. **时间**：每天北京时间早上（美股夜盘开始前，冬令时 09:00 前 / 夏令时 08:00 前）运行，这样战术层夜盘第一个检查时点就能读到当天的研判。
+   研判写在 `decisions/<北京日期>/decisions.json`，和美股交易日对应（北京周一早上写的，用于美股周一这个交易日）。
 1. **确认候选包**：运行 `.venv/bin/python -m wquant status`。
    - 如果今天还没有 scan，运行 `.venv/bin/python -m wquant scan`（没有 Webull 密钥时加 `--source synthetic --mode paper`，并告诉用户这是假数据）。
 2. **读取** `decisions/<今天日期>/candidates.json`。重点字段：
@@ -38,6 +40,13 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
      - 消息面和价格背离（坏消息不跌 / 好消息不涨）要特别指出
    - 给出 `regime`（risk_on / neutral / risk_off）、`confidence`、一句话 `summary`、`drivers`（依据）、`catalysts`（未来几天的关键事件）
    - **如实写置信度**：信号矛盾、消息不明确时用 neutral 或较低置信度。不要为了开对冲而抬高置信度
+   - **半导体短线方向 `semis`（必写，SOXL / SOXS 战术层直接读取）**：判断今晚到明天收盘半导体更可能往哪边走
+     - `bias`：`long`（只允许买 SOXL）/ `short`（只允许买 SOXS）/ `both`（两边都可以，交给夜盘 + KOSPI 信号）/ `none`（今天观望）
+     - `confidence`：低于 `swing.tactical.view_min_confidence`（默认 0.7）时战术层不会限制方向
+     - `reason`：一两句话，写清楚依据
+     - 依据重点：半导体相关新闻（龙头财报和指引、AI 资本开支、出口管制、关税）、战争和地缘、油价、利率和美元、宏观数据、
+       SOXX 近几天走势、KOSPI 和韩国半导体（三星、海力士）走势、费城半导体指数的期货 / 夜盘表现
+     - 重大事件（CPI、FOMC、龙头财报）当晚方向不明时，用 `none` 观望比硬猜好
    - **事件前推演** `event_scenarios`：未来 48 小时内还没公布的 high 事件，每个写三种情景（强于预期 / 符合预期 / 弱于预期）：
      触发条件（具体数字）、市场可能的反应、系统怎么应对。不要预测具体数字，市场预期和 nowcast 比你准；你的价值在于想清楚各种情况下怎么办
    - **事件后复盘** `event_reviews`：上次研判之后公布的事件，写实际值、市场实际反应、命中了哪个情景、有什么教训。
@@ -70,6 +79,7 @@ description: 审核 webull-quant 今天的交易候选并写出 decisions.json�
     "summary": "一句话结论",
     "drivers": ["依据 1（附数据或新闻来源）", "依据 2"],
     "catalysts": ["11/12 CPI", "11/19 NVDA 财报"],
+    "semis": {"bias": "short", "confidence": 0.75, "reason": "选举后 AI 监管担忧 + 存储竞争，SOXX 跌破 20 日线，KOSPI 半导体同步走弱"},
     "event_scenarios": [
       {
         "event": "10 月 CPI（11/10 08:30 ET）",
