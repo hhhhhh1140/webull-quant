@@ -176,8 +176,19 @@ def test_sandbox_and_live_keys_are_separate(monkeypatch):
 
 
 def test_extended_session_forces_limit():
-    o = build_webull_order(OrderIntent("AAPL", "BUY", 1, 100.0), {"type": "MARKET", "trading_session": "ALL_DAY"})
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    night = datetime(2026, 11, 10, 21, 0, tzinfo=et)
+    o = build_webull_order(OrderIntent("AAPL", "BUY", 1, 100.0), {"type": "MARKET", "trading_session": "ALL_DAY"}, night)
     assert o["order_type"] == "LIMIT" and o["support_trading_session"] == "ALL_DAY" and o["limit_price"] == "100.20"
+    # 04:00–20:00 ET 不能下 ALL_DAY 单，自动改成 ALL
+    for hh in (4, 9, 15, 19):
+        o = build_webull_order(OrderIntent("AAPL", "SELL", 1, 100.0), {"trading_session": "ALL_DAY"},
+                               datetime(2026, 11, 11, hh, 30, tzinfo=et))
+        assert o["support_trading_session"] == "ALL"
+    assert build_webull_order(OrderIntent("AAPL", "SELL", 1, 100.0), {"trading_session": "ALL_DAY"},
+                              datetime(2026, 11, 11, 3, 59, tzinfo=et))["support_trading_session"] == "ALL_DAY"
 
 
 def test_cache_merge_keeps_history(tmp_path, monkeypatch):

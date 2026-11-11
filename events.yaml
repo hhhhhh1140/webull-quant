@@ -16,10 +16,34 @@ events:
     importance: high
     consensus: {nonfarm_payrolls: "+65K（FactSet 中位数，区间 50K-125K；道琼斯 59K）", unemployment_rate: "4.2%", prior: "+29K"}
     source: https://insight.factset.com/total-nonfarm-payrolls-for-october-2026-are-projected-to-rise-by-65000
+    actual: {nonfarm_payrolls: "+165K（高于彭博全部 79 个预测）", unemployment_rate: "4.1%", revisions: "8-9 月合计上修 +84K"}
+    actual_source: https://www.ftportfolios.com/Commentary/EconomicResearch/2026/11/6/nonfarm-payrolls-increased-165,000-in-october
   - date: 2026-11-10
     time_et: "08:30"
     name: 10 月 CPI
     importance: high
-    consensus: {headline_yoy: "3.74%（克利夫兰联储 nowcast，11/05）", core_yoy: "2.48%（nowcast）", prior: "整体 3.7% / 核心 2.6%", prediction_market: "同比 3.7% 约 92%"}
-    source: https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting
-  # FOMC：尚未查到 2026 年 11-12 月会议日期，确认后补上
+    consensus: {headline_mom: "+0.3%（彭博共识；nowcast +0.24%，11/06）", core_mom: "+0.2%（彭博共识；nowcast +0.21%）", prior_mom: "整体 +0.6% / 核心 +0.3%", note: "本次 BLS 不公布同比；nowcast 同比约 3.74%，FactSet 估算约 4.0%（非官方）；11/09 CNBC 道琼斯共识仍为 +0.3% / +0.2%，Natixis +0.29% / +0.22%（https://www.cnbc.com/2026/11/09/october-cpi-report-2026-inflation.html）"}
+    source: https://stocktitan.net/articles/october-2026-cpi-preview-no-yearly-rate
+    actual: {headline_mom: "+0.4%", core_mom: "+0.3%", note: "均高于预期；2 年期 +17bp 至约 4.73%，10 年期约 5%，12 月加息定价约 97%"}
+    actual_source: https://www.benzinga.com/markets/equities/26/11/63117496/stock-market-today-hot-cpi-treasury-yields-5-percent-nvidia-slides
+  - date: 2026-11-13
+    time_et: "08:30"
+    name: 10 月 PPI
+    importance: medium
+    source: https://www.bls.gov/schedule/news_release/ppi.htm
+  - date: 2026-11-17
+    time_et: "08:30"
+    name: 10 月零售销售
+    importance: medium
+    source: https://fedratecalc.com/us-economic-calendar/november-2026/
+  - date: 2026-11-18
+    time_et: "14:00"
+    name: FOMC 会议纪要（10/27-28 会议）
+    importance: medium
+    source: https://www.federalreserve.gov/newsevents/2026-november.htm
+  - date: 2026-12-09
+    time_et: "14:00"
+    name: FOMC 利率决议（12/8-9，含点阵图）
+    importance: high
+    consensus: {note: "10 月 CPI 偏热后，期货定价 12 月加息约 97%（CappNotes 11/10 收盘，https://cappnotes.substack.com/p/closing-look-tuesday-november-10）；BofA 预期加息"}
+    source: https://www.federalreserve.gov/newsevents/2026-december.htm

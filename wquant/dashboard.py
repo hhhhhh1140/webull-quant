@@ -17,7 +17,8 @@ from . import journal
 from .config import ROOT, Settings
 
 HTML = Path(__file__).with_name("dashboard.html")
-SNAPSHOT_EVERY = 600   # 权益快照间隔（秒）
+SNAPSHOT_EVERY = 600   # 个股系统权益快照间隔（秒）
+COMBINED_EVERY = 60    # 两套系统合并快照间隔（秒），后台线程即使没人打开页面也会记录
 
 
 # ---------------------------------------------------------------- 成交与盈亏
@@ -219,7 +220,8 @@ def _account(settings: Settings) -> dict:
             "market_value": round(mv, 2), "invested": round(invested, 2), "unrealized": unrealized,
             "realized": realized, "positions": sorted(positions, key=lambda x: -x["market_value"]),
             "orders": sorted(orders, key=lambda o: o.get("place_time_at") or "", reverse=True),
-            "closed_trades": closed, "equity_history": history}
+            "closed_trades": closed, "equity_history": history,
+            "last_prices": {k: float(v.get("last_price") or 0) for k, v in (raw.items() if settings.has_webull_credentials else [])}}
 
 
 def _snapshot(env: str, snap: dict) -> list[dict]:
@@ -281,6 +283,63 @@ def _swing(settings: Settings) -> dict:
             "equity": eq, "gate": gate, "allowed": sorted(allowed)}
 
 
+def _tactical_live(settings: Settings, prices: dict[str, float]) -> dict:
+    """战术层实时权益 = 已实现（swing_equity 文件）+ 当前持仓按最新价的浮动盈亏。"""
+    from datetime import datetime as _dt
+    from . import swing_live as SL
+    env = settings.environment
+    cap = float(SL.swing_cfg(settings)["tactical"]["capital"])
+    eqp = SL._equity_path(env)
+    booked = float(json.loads(eqp.read_text()).get("equity", cap)) if eqp.exists() else cap
+    day = SL.trading_day(_dt.now(SL.ET))
+    sp = journal.STATE / f"swing_tactical_{env}_{day}.json"
+    st = json.loads(sp.read_text()) if sp.exists() else {}
+    pos = None
+    if st.get("qty") and st.get("symbol") and not st.get("done"):
+        sym, qty, entry = st["symbol"], float(st["qty"]), float(st["entry"])
+        px = prices.get(sym) or 0.0
+        if not px:
+            try:
+                from .webull_client import WebullClient
+                px = SL.WebullMarket(WebullClient(settings), lambda: _dt.now(SL.ET)).last_price(sym)[1]
+            except Exception:
+                px = None       # 取不到价格就不算浮盈，不用成本价冒充
+        pos = {"symbol": sym, "quantity": qty, "entry": round(entry, 4), "last_price": round(px, 4) if px else None,
+               "pnl": round(qty * (px - entry), 2) if px else None,
+               "pnl_pct": round(px / entry - 1, 4) if px and entry else None,
+               "peak": st.get("peak"), "adds": st.get("adds", 0), "frac": st.get("frac_total")}
+    unreal = (pos["pnl"] if pos else 0.0)
+    return {"capital": cap, "realized": round(booked - cap, 2), "unrealized": unreal,
+            "equity": round(booked + (unreal or 0), 2), "price_ok": unreal is not None, "position": pos, "day": str(day)}
+
+
+def _combined(settings: Settings, account: dict | None) -> dict:
+    """两套系统放在一起：各自本金、已实现、浮动、收益率，并按 COMBINED_EVERY 记录快照。"""
+    tac = _tactical_live(settings, (account or {}).get("last_prices") or {})
+    stock = None
+    if account:
+        stock = {k: account[k] for k in ("capital", "equity", "realized", "unrealized", "market_value")}
+        stock["positions"] = [{k: p[k] for k in ("symbol", "quantity", "cost_price", "last_price", "pnl", "pnl_pct")}
+                              for p in account["positions"]]
+    snap = {"ts": datetime.now().isoformat(timespec="seconds")}
+    if tac["price_ok"]:
+        snap.update(tac_equity=tac["equity"], tac_unrealized=tac["unrealized"], tac_ret=round(tac["equity"] / tac["capital"] - 1, 5))
+    if stock:
+        snap.update(stock_equity=stock["equity"], stock_unrealized=stock["unrealized"],
+                    stock_ret=round(stock["equity"] / stock["capital"] - 1, 5))
+    p = journal.STATE / f"combined_{settings.environment}.jsonl"
+    hist = [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+    last_ts = datetime.fromisoformat(hist[-1]["ts"]).timestamp() if hist else 0
+    if len(snap) > 1 and time.time() - last_ts >= COMBINED_EVERY - 2:   # 两边都读取失败就不记
+        journal.STATE.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(snap) + "\n")
+        hist.append(snap)
+    else:
+        hist = hist + [snap]
+    return {"stock": stock, "tactical": tac, "history": hist[-5000:]}
+
+
 def collect(settings: Settings) -> dict:
     data = {"generated_at": datetime.now().isoformat(timespec="seconds"), "environment": settings.environment,
             "events": _events(settings),
@@ -296,6 +355,11 @@ def collect(settings: Settings) -> dict:
         except Exception as e:   # 某一块失败不影响其他部分显示
             data[key] = None
             data.setdefault("errors", {})[key] = f"{type(e).__name__}: {e}"[:300]
+    try:
+        data["combined"] = _combined(settings, data.get("account"))
+    except Exception as e:
+        data["combined"] = None
+        data.setdefault("errors", {})["combined"] = f"{type(e).__name__}: {e}"[:300]
     return data
 
 
@@ -330,6 +394,24 @@ def serve(settings: Settings, port: int = 8765, cache_seconds: int = 30) -> None
             else:
                 self._send(404, b"not found", "text/plain")
 
+    def recorder():   # 没人打开页面时也每分钟记一次两套系统的权益和浮盈
+        while True:
+            time.sleep(COMBINED_EVERY)
+            try:
+                try:
+                    acct = _account(settings)
+                except Exception:
+                    acct = None
+                comb = _combined(settings, acct)      # 只算账户和两套系统，不重跑回测
+                with lock:
+                    if cache["data"] is not None:
+                        if acct is not None:
+                            cache["data"]["account"] = acct
+                        cache["data"]["combined"] = comb
+            except Exception as e:
+                print(f"后台记录失败: {type(e).__name__}: {e}"[:300], flush=True)
+
+    threading.Thread(target=recorder, daemon=True).start()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"仪表盘已启动: http://127.0.0.1:{port}   （Ctrl+C 退出）")
     try:

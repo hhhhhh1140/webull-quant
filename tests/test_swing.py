@@ -29,6 +29,14 @@ class FakeMarket:
     def kospi_move(self, now):
         return self.kospi
 
+    path = None                       # (lo, hi, vwap)；None = 用当前价
+
+    def path_stats(self, sym, day):
+        if self.path is None:
+            px = self.prices[sym]
+            return px, px, px
+        return self.path
+
 
 class FakeBroker:
     def __init__(self):
@@ -129,6 +137,10 @@ def test_view_gate_semis_override_and_low_confidence(env):
                      "semis": {"bias": "none", "confidence": 0.8, "reason": "CPI 前观望"}})
     allowed, why = SL.view_gate(s, DAY)
     assert allowed == set() and "观望" in why
+    write_view(tmp, {"regime": "risk_off", "confidence": 0.6, "summary": "x",
+                     "semis": {"bias": "none", "confidence": 0.55, "reason": "方向不明"}})
+    allowed, why = SL.view_gate(s, DAY)          # 低置信度的观望不拦
+    assert allowed == {"long", "short"} and "不够" in why
     write_view(tmp, {"regime": "risk_off", "confidence": 0.5, "summary": "x"})
     allowed, _ = SL.view_gate(s, DAY)
     assert allowed == {"long", "short"}
@@ -287,3 +299,90 @@ def test_trailing_after_add_then_multiple_reentries(env):
     assert books.qty("tactical", "SOXL") == 0
     sells = [o for o in br.orders if o[1] == "SELL"]
     assert len(sells) == 3                                                   # 止盈、止损、收盘平仓
+
+
+# ---------------------------------------------------------------- 分时路径 / 连续扫描
+PATH_ON = {"enabled": True, "vwap_filter": False, "veto_pct": 0.06, "scan": "continuous"}
+
+
+def test_path_signal_disabled_is_plain_threshold():
+    assert SL.path_signal(0.04, 104, 90, 110, 100, 0.03, {})[0] == 1
+    assert SL.path_signal(0.01, 101, 90, 110, 100, 0.03, {})[0] == 0
+
+
+def test_path_signal_veto_short_after_v_bounce():
+    # 昨收 100，夜盘跌到 92（-8%），现在 96.5（-3.5%）：从低点已经反弹 4.9% 还没到 6%，可以空
+    assert SL.path_signal(-0.035, 96.5, 92, 100, None, 0.03, PATH_ON)[0] == -1
+    # 反弹到 97.6（-2.4%，从低点 +6.1%）本来就不够阈值；跌回 -3.1% 但从低点 +6.4%（低点 91）→ 否决
+    side, why, _ = SL.path_signal(-0.031, 96.9, 91, 100, None, 0.03, PATH_ON)
+    assert side == 0 and "不空" in why
+
+
+def test_path_signal_vwap_filter_and_reversal():
+    pc = {"enabled": True, "vwap_filter": True}
+    assert SL.path_signal(0.04, 104, 95, 106, 105, 0.03, pc)[0] == 0          # 涨 4% 但在 VWAP 下方
+    assert SL.path_signal(0.04, 104, 95, 106, 103, 0.03, pc)[0] == 1
+    rev = {"enabled": True, "vwap_filter": True, "reversal_pct": 0.08}
+    side, why, is_rev = SL.path_signal(0.01, 101, 92, 101, 98, 0.03, rev)     # -8% 拉回 +1%
+    assert side == 1 and is_rev and "反转" in why
+
+
+def test_continuous_scan_enters_between_checkpoints(tmp_path, monkeypatch, env):
+    s, books, _ = env
+    s = Settings(raw={"swing": {"tactical": {"poll_seconds": 60, "sizing": {"mode": "fixed"}, "path": PATH_ON}}})
+    md = FakeMarket({"SOXL": 101.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=0.012)
+    br = FakeBroker()
+    st = SL.TacState(day=str(DAY))
+    st = SL.tactical_step(s, md, br, books, st, at("20:30"))          # 扫描窗口之前：什么都不做
+    assert not st.log
+    st = SL.tactical_step(s, md, br, books, st, at("21:00"))          # 检查时点：记一条
+    n = len(st.log)
+    for hh in ("21:01", "21:02", "21:30"):                              # 结论没变：不刷日志
+        st = SL.tactical_step(s, md, br, books, st, at(hh))
+    assert len(st.log) == n and not br.orders
+    md.prices["SOXL"] = 103.5                                           # 22:15 涨过 3%，不用等 23:00
+    st = SL.tactical_step(s, md, br, books, st, at("22:15"))
+    assert st.decided and br.orders[-1][:2] == ("SOXL", "BUY")
+
+
+def test_continuous_scan_vetoes_short_after_bounce(env):
+    s, books, _ = env
+    s = Settings(raw={"swing": {"tactical": {"poll_seconds": 60, "sizing": {"mode": "fixed"}, "path": PATH_ON}}})
+    md = FakeMarket({"SOXL": 96.9, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=-0.015)
+    md.path = (91.0, 100.0, None)
+    br = FakeBroker()
+    st = SL.tactical_step(s, md, br, books, SL.TacState(day=str(DAY)), at("21:30"))
+    assert not st.decided and not br.orders and "不空" in st.log[-1]
+
+
+def test_continuous_scan_ends_after_window(env):
+    s, books, _ = env
+    s = Settings(raw={"swing": {"tactical": {"poll_seconds": 60, "sizing": {"mode": "fixed"}, "path": PATH_ON}}})
+    md = FakeMarket({"SOXL": 100.5, "SOXS": 50.0}, {"SOXL": 100.0})
+    br = FakeBroker()
+    clock = {"t": at("20:50")}
+    st = SL.run_tactical_day(s, md, br, books, lambda: clock["t"],
+                             sleep_fn=lambda sec: clock.__setitem__("t", clock["t"] + timedelta(seconds=sec)))
+    assert st.done and not br.orders and set(st.evaluated) == {"21:00", "23:00", "01:30", "04:00"}
+    assert len(st.log) < 15                                             # 7 小时每分钟扫描，但日志不刷屏
+
+
+def test_trailing_stop_from_peak_then_rebuy(env):
+    s, books, _ = env
+    s = Settings(raw={"swing": {"tactical": {"poll_seconds": 60, "sizing": {"mode": "fixed"}, "trail_pct": 0.07,
+                                              "add_step": None}}})
+    md = FakeMarket({"SOXL": 104.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=0.012)
+    br = FakeBroker()
+    st = SL.tactical_step(s, md, br, books, SL.TacState(day=str(DAY)), at("21:00"))
+    assert st.qty == 9
+    for px, hh in ((120.0, "05:00"), (112.0, "10:00")):                 # 最高 120，回撤 6.7%：还不卖
+        md.prices["SOXL"] = px
+        st = SL.tactical_step(s, md, br, books, st, at(hh))
+    assert st.qty == 9
+    md.prices["SOXL"] = 111.0                                           # 120×0.93 = 111.6 → 卖（仍高于均价，不是普通止损）
+    st = SL.tactical_step(s, md, br, books, st, at("10:30"))
+    assert st.qty == 0 and st.stopped and "移动止损" in st.log[-1]
+    for px, hh in ((108.0, "11:00"), (111.3, "11:30")):                 # 低点 108 反弹 3% 买回
+        md.prices["SOXL"] = px
+        st = SL.tactical_step(s, md, br, books, st, at(hh))
+    assert st.reentries == 1 and br.orders[-1][:2] == ("SOXL", "BUY")

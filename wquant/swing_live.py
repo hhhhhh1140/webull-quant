@@ -43,8 +43,18 @@ DEFAULTS = {
                  "max_frac_ovn": 1.0, "max_frac": 1.3,
                  "add_step": 0.03, "add_frac": 0.33, "add_from": "04:00", "add_last": "15:00",
                  "trail_after_add": 0.06,
+                 "trail_pct": None,                                      # 移动止损：从持仓最高价回撤这个比例就卖（之后反弹 rebound_pct 买回）
                  "poll_seconds": 60, "sides": ["long", "short"],
                  "view_gate": True, "view_min_confidence": 0.7,
+                 # 分时路径：不只看"现在相对昨收"，还看昨收以来（盘后 + 夜盘 + 盘前）的高低点和 VWAP
+                 "path": {"enabled": False,
+                          "vwap_filter": True,      # 做多要在 VWAP 上方，做空要在 VWAP 下方
+                          "veto_pct": None,         # 做多但已经从高点回落 ≥ 这个比例 / 做空但已经从低点反弹 ≥ 这个比例 → 不做
+                          "reversal_pct": None,     # 从低点反弹（或从高点回落）≥ 这个比例，算作反转信号
+                          "reversal_min_move": 0.0, # 反转信号还要求相对昨收至少翻到这个涨跌（做多 ≥ +x，做空 ≤ -x）
+                          "reversal_korea": True,   # 反转信号是否也要韩国确认
+                          "scan": "checkpoints",
+                          "scan_from": None, "scan_to": None},  # 连续扫描的起止时间（美东），None = 第一个 / 最后一个检查时点   # checkpoints = 只在检查时点判断；continuous = 首个到最后一个时点之间每次轮询都判断
                  # 动态仓位 = base × 信号强弱倍数 × 趋势效率系数，限制在 [min, max]
                  "sizing": {"mode": "dynamic", "base": 0.33, "signal_cap": 2.0, "use_trend_efficiency": False,
                             "trend_index": "SOXX", "er_window": 10, "er_tiers": [[0.2, 0.6], [0.4, 1.0], [99, 1.3]],
@@ -94,6 +104,31 @@ class Market(Protocol):
     def prev_rth_close(self, sym: str, day: date) -> float: ...
     def daily(self, sym: str, count: int) -> pd.DataFrame: ...
     def kospi_move(self, now: datetime) -> float | None: ...
+    def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]: ...
+
+
+def _kospi_daily_closes() -> list[tuple[date, float]]:
+    """KOSPI 最近几天的官方收盘价（Yahoo 日线，含收盘集合竞价），[(韩国日期, 收盘)]；取不到返回空。
+    当天还没收盘时，最后一条是盘中实时价。"""
+    import requests
+    from .intraday_data import KOSPI_URL
+    try:
+        r = requests.get(KOSPI_URL, params={"interval": "1d", "range": "10d"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        j = r.json()["chart"]["result"][0]
+        days = pd.to_datetime(j["timestamp"], unit="s", utc=True).tz_convert("Asia/Seoul").date
+        return [(d, float(c)) for d, c in zip(days, j["indicators"]["quote"][0]["close"]) if c is not None]
+    except Exception:
+        return []
+
+
+def _kospi_prev_close(kday: date) -> float | None:
+    """KOSPI 在 kday（韩国日期）之前最后一个交易日的官方收盘价。取不到返回 None。"""
+    closes = [c for d, c in _kospi_daily_closes() if d < kday]
+    return closes[-1] if closes else None
+
+
+KOSPI_CLOSE_KST = time(15, 35)   # 15:30 收盘，留 5 分钟让官方收盘价出来
 
 
 class WebullMarket:
@@ -116,6 +151,17 @@ class WebullMarket:
         rth = b[(b.session == "RTH") & (b.index.date < day)]
         return float(rth.close.iloc[-1])
 
+    def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]:
+        """昨天常规时段收盘以来（盘后 + 夜盘 + 盘前 + 今天）的最低、最高和 VWAP，用 5 分钟线。"""
+        b = self._bars(sym, "M5", 600)
+        rth = b[(b.session == "RTH") & (b.index.date < day)]
+        w = b[b.index > rth.index[-1]]
+        if w.empty:
+            return float("nan"), float("nan"), None
+        vol = w.volume.sum()
+        vwap = float(((w.high + w.low + w.close) / 3 * w.volume).sum() / vol) if vol > 0 else None
+        return float(w.low.min()), float(w.high.max()), vwap
+
     def kospi_move(self, now: datetime) -> float | None:
         """KOSPI 当天涨跌（相对上一交易日收盘），用 Yahoo 5 分钟线，只取已收盘的 K 线。"""
         import requests
@@ -133,10 +179,23 @@ class WebullMarket:
         today_kst = pd.Timestamp(now).tz_convert("Asia/Seoul").date()
         if last_day != today_kst:
             return None                      # 今天韩国休市或还没开盘：不拿昨天的数据冒充
-        prev = df[kday < last_day]
-        if prev.empty:
-            return None
-        return float(df.close.iloc[-1] / prev.close.iloc[-1] - 1)
+        # 昨收用日线的官方收盘价：5 分钟线最后一根不含 15:20-15:30 的收盘集合竞价，可能差很多
+        #（2026-11-06 最后一根 5 分钟线 ≈5100，官方收盘 5059.69，当天涨跌被低估 0.8 个点）
+        # 收盘以后，当天的值也用日线的官方收盘价（同样是集合竞价的问题）
+        daily = _kospi_daily_closes()
+        prevs = [c for d, c in daily if d < last_day]
+        prev_close = prevs[-1] if prevs else None
+        if prev_close is None:
+            prev = df[kday < last_day]
+            if prev.empty:
+                return None
+            prev_close = float(prev.close.iloc[-1])
+        cur = float(df.close.iloc[-1])
+        if pd.Timestamp(now).tz_convert("Asia/Seoul").time() >= KOSPI_CLOSE_KST:
+            today = [c for d, c in daily if d == last_day]
+            if today:
+                cur = today[-1]
+        return float(cur / prev_close - 1)
 
     def daily(self, sym: str, count: int) -> pd.DataFrame:
         from .webull_client import _json, _unwrap_list, bars_to_frame
@@ -226,6 +285,7 @@ class TacState:
     stopped: bool = False
     low_after_stop: float | None = None
     reentries: int = 0
+    scan_note: str = ""                             # 连续扫描上一次的结论（只在变化时写日志）
     done: bool = False
     pnl: float = 0.0
     equity_start: float = 0.0
@@ -300,8 +360,9 @@ def view_gate(settings: Settings, day: date) -> tuple[set, str]:
     bias = semis.get("bias")
     if bias is None:
         bias = {"risk_off": "short", "risk_on": "long"}.get(mv.get("regime"), "both")
-    if bias in ("long", "short") and conf < t["view_min_confidence"]:
-        return sides, f"研判偏{'多' if bias == 'long' else '空'}但置信度 {conf:.2f} 不够，两边都可以做"
+    if bias in ("long", "short", "none") and conf < t["view_min_confidence"]:
+        lab = {"long": "偏多", "short": "偏空", "none": "建议观望"}[bias]
+        return sides, f"研判{lab}但置信度 {conf:.2f} 不够，两边都可以做"
     if bias == "none":
         return set(), f"研判建议今天观望（置信度 {conf:.2f}）"
     if bias == "long":
@@ -341,6 +402,71 @@ def position_frac(t: dict, move: float, korea_move: float | None, er: float | No
     er_txt = f"{er:.2f}" if er is not None else "无数据"
     return frac, (f"仓位 {frac:.0%} = {sz.get('base', 0.33):.0%} × 信号 {sig:.2f} × 趋势效率系数 {ef:.1f}"
                   f"（{sz.get('trend_index', 'SOXX')} {sz.get('er_window', 10)} 日趋势效率 {er_txt}）")
+
+
+def _continuous(t: dict) -> bool:
+    pc = t.get("path") or {}
+    return bool(pc.get("enabled")) and pc.get("scan") == "continuous"
+
+
+def _scan_window(t: dict, day: date) -> tuple[datetime, datetime]:
+    pc = t.get("path") or {}
+    return _at(day, pc.get("scan_from") or t["checkpoints"][0]), _at(day, pc.get("scan_to") or t["checkpoints"][-1])
+
+
+def anchor_sides(move: float, from_low: float, from_high: float, th: float, anchor: str) -> dict:
+    """按锚点给出可做的方向和强度 {+1: 强度, -1: 强度}。
+    prev_close = 相对昨收；extreme = 相对昨收以来的最低 / 最高（从 -3% 拉到 0 也算涨 3%）；either = 两者任一。"""
+    out = {}
+    up = [move] if anchor in ("prev_close", "either") else []
+    dn = [move] if anchor in ("prev_close", "either") else []
+    if anchor in ("extreme", "either"):
+        up.append(from_low)
+        dn.append(from_high)
+    if up and max(up) >= th:
+        out[1] = max(up)
+    if dn and min(dn) <= -th:
+        out[-1] = -min(dn)
+    return out
+
+
+def pick_side(cands: dict, low_is_later: bool) -> int:
+    """两个方向都满足（先大涨后大跌或反过来）时，按最近一个极值判断：最近是低点 → 正在反弹 → 做多。"""
+    if len(cands) == 2:
+        return 1 if low_is_later else -1
+    return next(iter(cands), 0)
+
+
+def path_signal(move: float, px: float, lo: float, hi: float, vwap: float | None, threshold: float,
+                pc: dict) -> tuple[int, str, bool]:
+    """根据昨收以来的分时路径给方向。返回 (方向 +1/-1/0, 说明, 是否反转信号)。
+    move = 现价相对昨收；lo / hi = 昨收以来最低 / 最高；vwap = 昨收以来成交量加权均价。"""
+    side = 1 if move >= threshold else -1 if move <= -threshold else 0
+    if not pc.get("enabled"):
+        return side, "", False
+    from_low, from_high = px / lo - 1, px / hi - 1
+    desc = f"昨收以来低 {lo / px * (1 + move) - 1:+.1%} / 高 {hi / px * (1 + move) - 1:+.1%}，从低点 {from_low:+.1%}、从高点 {from_high:+.1%}"
+    if vwap:
+        desc += f"，VWAP {vwap:.2f}（现价{'上' if px >= vwap else '下'}方）"
+    veto, rev = pc.get("veto_pct"), pc.get("reversal_pct")
+    use_vwap = pc.get("vwap_filter") and vwap
+    if side > 0:
+        if use_vwap and px < vwap:
+            return 0, desc + " → 涨了但在 VWAP 下方，不追", False
+        if veto and from_high <= -veto:
+            return 0, desc + f" → 已经从高点回落 {-from_high:.1%}，不追", False
+    elif side < 0:
+        if use_vwap and px > vwap:
+            return 0, desc + " → 跌了但在 VWAP 上方，不空", False
+        if veto and from_low >= veto:
+            return 0, desc + f" → 已经从低点反弹 {from_low:.1%}，不空", False
+    elif rev:
+        m = pc.get("reversal_min_move", 0.0) or 0.0
+        if from_low >= rev and move >= m and (not use_vwap or px >= vwap):
+            return 1, desc + f" → 从低点反弹 {from_low:.1%}，V 形反转做多", True
+        if from_high <= -rev and move <= -m and (not use_vwap or px <= vwap):
+            return -1, desc + f" → 从高点回落 {-from_high:.1%}，倒 V 反转做空", True
+    return side, desc, False
 
 
 def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacState, now: datetime,
@@ -409,10 +535,14 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             note("KILL_SWITCH 存在，今天不做")
             st.done = True
             return st
+        pc = t.get("path") or {}
+        lo_t, hi_t = _scan_window(t, day)
         due = [c for c in t["checkpoints"] if now >= _at(day, c) and c not in st.evaluated]
-        if not due:
+        scanning = _continuous(t) and lo_t <= now <= hi_t
+        if not due and not scanning:
             return st
-        cp = due[-1]                              # 错过了多个时点（比如进程晚启动）只按最新的判断一次
+        # 错过了多个时点（比如进程晚启动）只按最新的判断一次；连续扫描时非检查时点标成"扫描"
+        cp = due[-1] if due else f"{now.astimezone(ET):%H:%M} 扫描"
         st.evaluated += due
         if now >= _at(day, t["last_reentry"]):
             note("已过入场时间窗口，今天不做")
@@ -426,9 +556,16 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         prev = md.prev_rth_close(t["long"], day)
         _, px = md.last_price(t["long"])
         st.move = px / prev - 1
-        side = 1 if st.move >= t["threshold"] else -1 if st.move <= -t["threshold"] else 0
         why = f"{cp} 检查：{t['long']} 相对昨收 {st.move:+.1%}"
-        if side and t.get("korea_confirm") is not None:
+        is_rev = False
+        if pc.get("enabled"):
+            lo, hi, vwap = md.path_stats(t["long"], day)
+            lo, hi = (px, px) if math.isnan(lo) else (min(lo, px), max(hi, px))
+            side, desc, is_rev = path_signal(st.move, px, lo, hi, vwap, t["threshold"], pc)
+            why += f"（{desc}）"
+        else:
+            side = 1 if st.move >= t["threshold"] else -1 if st.move <= -t["threshold"] else 0
+        if side and t.get("korea_confirm") is not None and (not is_rev or pc.get("reversal_korea", True)):
             st.korea_move = md.kospi_move(now)
             why += f"，KOSPI {st.korea_move:+.1%}" if st.korea_move is not None else "，KOSPI 无数据"
             if st.korea_move is None or (st.korea_move > 0) != (side > 0) or abs(st.korea_move) < t["korea_confirm"]:
@@ -437,9 +574,14 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         if side and ("long" if side > 0 else "short") not in allowed:
             why += " → 方向被市场研判限制"
             side = 0
-        last_cp = all(c in st.evaluated for c in t["checkpoints"])
+        last_cp = all(c in st.evaluated for c in t["checkpoints"]) and (not _continuous(t) or now >= hi_t)
         if not side:
-            note(why + ("，今天不做" if last_cp else "，继续等下一个时点"))
+            # 连续扫描每分钟都会走到这里：检查时点照常记一条，其余只在结论变化时记，避免刷屏
+            tag = why.rsplit("→", 1)[-1] if "→" in why else "无信号"
+            tag = "".join(ch for ch in tag if not (ch.isdigit() or ch in "+-.%）) "))   # 去掉会变的数字
+            if due or last_cp or tag != st.scan_note:
+                note(why + ("，今天不做" if last_cp else "，继续等" if _continuous(t) else "，继续等下一个时点"))
+            st.scan_note = tag
             if last_cp:
                 st.decided = st.done = True
             return st
@@ -481,6 +623,9 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         elif st.adds and t.get("trail_after_add") and px <= st.peak * (1 - t["trail_after_add"]):
             exit_(px, f"加仓后从最高 {st.peak:.2f} 回撤 {t['trail_after_add']:.0%} 止盈")
             st.stopped, st.low_after_stop = True, px
+        elif t.get("trail_pct") and px <= st.peak * (1 - t["trail_pct"]):
+            exit_(px, f"移动止损：从持仓最高 {st.peak:.2f} 回撤 {t['trail_pct']:.0%}")
+            st.stopped, st.low_after_stop = True, px
         elif (t.get("add_step") and not in_ovn() and _at(day, t["add_from"]) <= now < _at(day, t["add_last"])
               and st.frac_total < t["max_frac"] - 1e-6 and px >= st.last_add * (1 + t["add_step"])):
             add(px)
@@ -506,6 +651,9 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
     if st.done:
         print(f"[战术层] {day} 已经跑完：{st.log[-1] if st.log else ''}")
         return st
+    if _continuous(t):
+        lo_t, hi_t = _scan_window(t, day)
+        print(f"[战术层] 连续扫描 {lo_t:%H:%M}–{hi_t:%H:%M} ET（每 {t['poll_seconds']} 秒），看昨收以来的高低点 / VWAP")
     print(f"[战术层] 交易日 {day}：检查时点 {', '.join(t['checkpoints'])} ET，{t['exit']} ET 平仓；"
           f"系统权益 ${system_equity(settings):,.0f}，每笔 {t['position_frac']:.0%}")
     while not st.done:
@@ -521,6 +669,10 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
         if not st.decided:
             pending = [_at(day, c) for c in t["checkpoints"] if c not in st.evaluated]
             nxt = min(pending) if pending else now + timedelta(seconds=t["poll_seconds"])
+            if _continuous(t):                     # 扫描窗口内每 poll_seconds 看一次
+                lo_t, hi_t = _scan_window(t, day)
+                if now < hi_t:
+                    nxt = min(nxt, max(lo_t, now + timedelta(seconds=t["poll_seconds"])))
             sleep_fn(max(1.0, (nxt - now_fn()).total_seconds()))
         else:
             sleep_fn(t["poll_seconds"])
