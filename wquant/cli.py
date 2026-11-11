@@ -72,10 +72,21 @@ def cmd_scan(args, s):
 
 
 def cmd_execute(args, s):
-    from .engine import execute
+    from datetime import datetime
+    from .engine import day_dir, execute
     _apply_mode(args, s)
     review = args.review or {"claude_code": "file", "api": "api", "off": "off"}[s.section("ai").get("mode", "claude_code")]
-    execute(s, review=review, confirm_live=args.confirm_live, source=args.source)
+    # 真实下单每天只执行一次（定时任务和手动运行撞在一起时防止重复下单）
+    marker = day_dir() / f"executed_{s.mode}_{s.environment}.json"
+    if s.mode == "webull" and marker.exists() and not args.force:
+        print(f"今天已经执行过（{marker.name}），不再重复下单。确实要再执行一次请加 --force")
+        return 0
+    res = execute(s, review=review, confirm_live=args.confirm_live, source=args.source)
+    if s.mode == "webull":
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"at": datetime.now().isoformat(timespec="seconds"),
+                                      "orders": [{k: r.get(k) for k in ("symbol", "signal", "outcome")} for r in res]},
+                                     ensure_ascii=False, indent=1))
     return 0
 
 
@@ -131,6 +142,91 @@ def cmd_orders(args, s):
               f"限价 {px:<12s} {o.get('support_trading_session', ''):7s} {o.get('status'):12s} {fill}")
     led = owned(s.environment)
     print(f"\n系统持仓账本: {led or '空'}")
+    return 0
+
+
+def _max_dd(values: list[float]) -> float:
+    peak, dd = None, 0.0
+    for v in values:
+        peak = v if peak is None else max(peak, v)
+        dd = min(dd, v / peak - 1)
+    return dd
+
+
+def _bench(sym: str, start: str) -> float | None:
+    """基准：从 start 那天收盘到最新收盘的涨跌（用本地日线缓存）。"""
+    from .data import CACHE, load_csv
+    p = CACHE / f"{sym}.csv"
+    if not p.exists():
+        return None
+    df = load_csv(p)
+    before = df[df.index.date <= __import__("datetime").date.fromisoformat(start)]
+    if before.empty:
+        return None
+    return float(df.close.iloc[-1] / before.close.iloc[-1] - 1)
+
+
+def cmd_compare(args, s):
+    """两套系统并排对比：个股选股系统（max_capital）和 SOXL/SOXS 战术层（tactical.capital），各自独立记账。"""
+    from datetime import datetime
+    from . import journal
+    from . import swing_live as SL
+    from .dashboard import _account
+    env = s.environment
+    rows = []
+    # ---- 个股系统
+    try:
+        a = _account(s)
+        hist = [json.loads(x) for x in (journal.STATE / f"equity_{env}.jsonl").read_text().splitlines()] \
+            if (journal.STATE / f"equity_{env}.jsonl").exists() else []
+        fills = json.loads((journal.STATE / f"fills_{env}.json").read_text()) if (journal.STATE / f"fills_{env}.json").exists() else []
+        start = min((f["time"][:10] for f in fills), default=None)
+        days = len({f["time"][:10] for f in fills})
+        rows.append({"name": "个股选股系统", "capital": a["capital"], "equity": a["equity"], "realized": a["realized"],
+                     "unrealized": a["unrealized"], "trades": len(fills), "days": days, "start": start,
+                     "dd": _max_dd([h["equity"] for h in hist] + [a["equity"]]),
+                     "holding": ", ".join(f"{p['symbol']} {p['quantity']:g}" for p in a["positions"]) or "空仓"})
+    except Exception as e:
+        rows.append({"name": "个股选股系统", "error": f"{type(e).__name__}: {e}"[:200]})
+    # ---- 战术层
+    cap = float(SL.swing_cfg(s)["tactical"]["capital"])
+    eqp = SL._equity_path(env)
+    eqd = json.loads(eqp.read_text()) if eqp.exists() else {"equity": cap, "history": []}
+    orders = []
+    for f in sorted(journal.LOGS.glob("*.jsonl")):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r.get("event") == "swing_order" and r.get("status") not in ("error", "rejected", None):
+                orders.append(r)
+    states = sorted(journal.STATE.glob(f"swing_tactical_{env}_*.json"))
+    first = states[0].stem.rsplit("_", 1)[-1] if states else None
+    traded_days = {r["ts"][:10] for r in orders}
+    held = SL.Books(env).data.get("tactical", {})
+    rows.append({"name": "SOXL/SOXS 战术层", "capital": cap, "equity": eqd["equity"], "realized": eqd["equity"] - cap,
+                 "unrealized": 0.0, "trades": len(orders), "days": len(traded_days), "start": first,
+                 "dd": _max_dd([cap] + [h["equity"] for h in eqd.get("history", [])]),
+                 "holding": ", ".join(f"{k} {v:g}" for k, v in held.items()) or "空仓",
+                 "watched": len(states)})
+    print(f"环境 {env}    {datetime.now():%Y-%m-%d %H:%M}（两套系统各自独立本金，按收益率比较）\n")
+    for r in rows:
+        if "error" in r:
+            print(f"{r['name']}: 读取失败 {r['error']}\n")
+            continue
+        ret = r["equity"] / r["capital"] - 1
+        print(f"【{r['name']}】 起始 {r['start'] or '-'}")
+        print(f"  本金 ${r['capital']:,.0f}  权益 ${r['equity']:,.2f}  收益率 {ret:+.2%}"
+              f"（已实现 ${r['realized']:+,.2f} / 浮动 ${r['unrealized']:+,.2f}）  最大回撤 {r['dd']:+.2%}")
+        extra = f"，已运行 {r['watched']} 个交易日" if r.get("watched") else ""
+        print(f"  成交 {r['trades']} 笔，{r['days']} 天有交易{extra}；当前持仓：{r['holding']}")
+        if r["start"]:
+            b = [(sym, _bench(sym, r["start"])) for sym in ("QQQ", "SOXX")]
+            print("  同期基准：" + "  ".join(f"{sym} {v:+.2%}" for sym, v in b if v is not None))
+        print()
+    snap = {"ts": datetime.now().isoformat(timespec="seconds"),
+            **{r["name"]: round(r["equity"], 2) for r in rows if "equity" in r}}
+    journal.STATE.mkdir(parents=True, exist_ok=True)
+    with open(journal.STATE / f"compare_{env}.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(snap, ensure_ascii=False) + "\n")
     return 0
 
 
@@ -274,6 +370,7 @@ def main(argv=None) -> int:
     e = sub.add_parser("execute", help="阶段2：读审核结论 → 风控 → 下单")
     common(e, live=True)
     e.add_argument("--review", choices=["file", "api", "off"], help="审核来源，默认按 ai.mode")
+    e.add_argument("--force", action="store_true", help="今天已经执行过也再执行一次")
     r = sub.add_parser("run", help="scan + execute（claude_code 模式下只做 scan）")
     common(r, live=True)
     r.add_argument("--no-ai", action="store_true", help="跳过审核，纯规则执行")
@@ -301,13 +398,14 @@ def main(argv=None) -> int:
     sw.add_argument("what", choices=["core", "tactical", "status", "backtest"])
     sw.add_argument("--mode", choices=["dry_run", "webull"], help="默认 dry_run 只打印；webull 才下单")
     sw.add_argument("--confirm-live", action="store_true")
+    sub.add_parser("compare", help="个股系统 vs SOXL/SOXS 战术层：收益率、回撤、交易次数并排对比")
     db = sub.add_parser("dashboard", help="启动本地网页仪表盘（只读）")
     db.add_argument("--port", type=int, default=8765)
 
     args = p.parse_args(argv)
     s = load_settings(args.config)
     cmds = {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
-            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "overnight-bt": cmd_overnight, "swing": cmd_swing}
+            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "compare": cmd_compare, "overnight-bt": cmd_overnight, "swing": cmd_swing}
     return cmds[args.cmd](args, s)
 
 

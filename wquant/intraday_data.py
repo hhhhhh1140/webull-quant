@@ -135,6 +135,12 @@ def load_kospi(interval: str = "1h") -> pd.DataFrame:
     kday = (kst - pd.Timedelta(minutes=minutes)).date
     df["kday"] = kday
     day_close = df.groupby("kday").close.last()
+    if interval != "1d":
+        # 用日线的官方收盘价（含收盘集合竞价）；分钟线最后一根可能和官方收盘差很多
+        official = load_kospi("1d")
+        if not official.empty:
+            oc = official.groupby("kday").close.last()
+            day_close = oc.reindex(day_close.index).fillna(day_close)
     prev = day_close.shift(1)
     df["prev_close"] = df["kday"].map(prev)
     df.index = df.index.tz_convert("America/New_York")
@@ -147,3 +153,17 @@ def kospi_move(K: pd.DataFrame, t) -> float | None:
     if i < 0:
         return None
     return float(K.close.iloc[i] / K.prev_close.iloc[i] - 1)
+
+
+def kospi_path(K: pd.DataFrame, t) -> tuple[float, float, float] | None:
+    """时刻 t（美东）已知的 KOSPI 当天走势：(相对昨收, 相对当天最低, 相对当天最高)，只用已收盘的 K 线。"""
+    i = K.index.searchsorted(t, side="right") - 1
+    if i < 0:
+        return None
+    kd = K.kday.iloc[i]
+    j = i
+    while j > 0 and K.kday.iloc[j - 1] == kd:
+        j -= 1
+    seg = K.iloc[j:i + 1]
+    c = float(seg.close.iloc[-1])
+    return c / float(seg.prev_close.iloc[-1]) - 1, c / float(seg.low.min()) - 1, c / float(seg.high.max()) - 1

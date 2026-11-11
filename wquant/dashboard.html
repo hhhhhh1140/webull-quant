@@ -167,6 +167,15 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
 .status-CANCELED::before, .status-REJECTED::before, .status-FAILED::before { content: "● "; color: var(--text-muted); }
 .status-SUBMITTED::before, .status-PARTIAL_FILLED::before, .status-PENDING::before { content: "● "; color: var(--warning); }
 </style>
+<style>
+.cmp { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin:8px 0 12px; }
+.cmp .sys { border:1px solid var(--border, rgba(127,127,127,.25)); border-radius:10px; padding:12px 14px; }
+.cmp .sys h3 { margin:0 0 6px; font-size:14px; }
+.cmp .big { font-size:24px; font-weight:650; }
+.cmp .rows { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; margin-top:6px; }
+.cmp .rows span:nth-child(odd) { color:var(--text-muted, #888); }
+.cmp .hold { font-size:12px; color:var(--text-muted, #888); margin-top:6px; line-height:1.5; }
+</style>
 </head>
 <body>
 <div class="wrap">
@@ -179,6 +188,15 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
   </header>
   <div id="errors"></div>
 
+  <div class="card" style="margin-bottom:14px">
+    <h2>两套系统对比（实时）</h2>
+    <div class="sub">各自独立本金，按收益率比较；权益 = 本金 + 已实现 + 持仓浮盈，后台每分钟记录一次（state/combined_&lt;env&gt;.jsonl）</div>
+    <div class="cmp" id="cmpCards"></div>
+    <div class="legend" id="cmpLegend"></div>
+    <div class="chart" id="cmpChart"></div>
+  </div>
+
+  <h2 style="margin:6px 0 10px">个股选股系统</h2>
   <div class="grid kpis" id="kpis"></div>
 
   <div class="card" style="margin-bottom:14px">
@@ -560,10 +578,41 @@ function renderSwing(sw) {
   $("swTac").innerHTML = g;
 }
 
+function renderCombined(c) {
+  if (!c) { $("cmpCards").innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  const card = (name, x, hold, extra = "") => {
+    if (!x) return `<div class="sys"><h3>${name}</h3><div class="empty">账户读取失败</div></div>`;
+    const ret = x.capital ? x.equity / x.capital - 1 : 0;
+    return `<div class="sys"><h3>${name}</h3>
+      <div class="big">${fmtUsd(x.equity, 2)} <span class="${signCls(ret)}" style="font-size:14px">${fmtPct(ret, 2)}</span></div>
+      <div class="rows"><span>本金</span><b>${fmtUsd(x.capital)}</b>
+        <span>浮动盈亏</span><b class="${signCls(x.unrealized)}">${fmtSigned(x.unrealized, 2)}</b>
+        <span>已实现</span><b class="${signCls(x.realized)}">${fmtSigned(x.realized, 2)}</b>${extra}</div>
+      <div class="hold">${hold}</div></div>`;
+  };
+  const s = c.stock, t = c.tactical;
+  const sHold = s ? (s.positions.length ? s.positions.map((p) => `${esc(p.symbol)} ${p.quantity} 股 @ ${p.last_price.toFixed(2)}（<span class="${signCls(p.pnl)}">${fmtPct(p.pnl_pct, 1)}</span>）`).join("<br>") : "空仓") : "";
+  const tp = t?.position;
+  const tHold = tp ? `${esc(tp.symbol)} ${tp.quantity} 股，均价 ${tp.entry.toFixed(2)} → ${tp.last_price == null ? '<span class="sign-down">现价读取失败，浮盈暂不计入</span>' : `现价 ${tp.last_price.toFixed(2)}（<span class="${signCls(tp.pnl)}">${fmtPct(tp.pnl_pct, 1)}</span>）`}<br>持仓最高 ${tp.peak ?? "—"} · 加仓 ${tp.adds} 次 · 仓位 ${((tp.frac || 0) * 100).toFixed(0)}%` : `交易日 ${esc(t?.day || "")}：空仓`;
+  let total = "";
+  if (s && t) {
+    const cap = s.capital + t.capital, eq = s.equity + t.equity, ret = eq / cap - 1;
+    total = card("合计", { capital: cap, equity: eq, unrealized: s.unrealized + (t.unrealized || 0), realized: s.realized + t.realized }, "两套系统加总");
+  }
+  $("cmpCards").innerHTML = card("个股选股系统", s, sHold) + card("SOXL / SOXS 战术层", t, tHold) + total;
+  const rows = (c.history || []).map((h) => ({ x: h.ts, stock: h.stock_ret ?? null, tac: h.tac_ret ?? null }));
+  const series = [{ key: "stock", label: "个股", color: "--series-1" }, { key: "tac", label: "战术层", color: "--series-2" }];
+  $("cmpLegend").innerHTML = series.map((x) => `<span><i style="background:${css(x.color)}"></i>${x.label} 收益率</span>`).join("");
+  lineChart($("cmpChart"), rows, series, {
+    fmtX: (t, full) => full ? t.replace("T", " ") : t.slice(5, 16).replace("T", " "),
+    fmtY: (v, full) => v == null ? "—" : fmtPct(v, full ? 2 : 1),
+  });
+}
+
 let last = null;
 function renderAll(d) {
   last = d;
-  renderHeader(d); renderView(d.decisions); renderEvents(d.events, d.decisions); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
+  renderHeader(d); renderCombined(d.combined); renderView(d.decisions); renderEvents(d.events, d.decisions); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
   renderPositions(d.account); renderDecisions(d.decisions); renderOrders(d.account); renderBacktest(d.backtest);
 }
 

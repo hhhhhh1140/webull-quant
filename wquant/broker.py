@@ -15,10 +15,22 @@ from .config import ROOT, Settings
 from .risk import OrderIntent
 
 
-def build_webull_order(intent: OrderIntent, order_cfg: dict) -> dict:
+def session_for(configured: str, now=None) -> str:
+    """Webull 只允许在夜盘（20:00–04:00 ET）下 ALL_DAY 单，其他时间会被拒（OPENAPI_ALL_DAY_ONLY_ALLOW_IN_NIGHT_TRADING_TIME_RANGE）。
+    配置成 ALL_DAY 时：夜盘用 ALL_DAY，04:00–20:00 改用 ALL（盘前 + 常规 + 盘后）。"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    s = configured.upper()
+    if s != "ALL_DAY":
+        return s
+    t = (now or datetime.now(ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York"))
+    return "ALL_DAY" if (t.hour >= 20 or t.hour < 4) else "ALL"
+
+
+def build_webull_order(intent: OrderIntent, order_cfg: dict, now=None) -> dict:
     """订单格式与官方 webull-openapi-mcp 的 _build_stock_order 一致。"""
     otype = order_cfg.get("type", "LIMIT").upper()
-    session = order_cfg.get("trading_session", "CORE").upper()
+    session = session_for(order_cfg.get("trading_session", "CORE"), now)
     if session != "CORE":
         otype = "LIMIT"   # 盘前盘后/夜盘流动性差，只允许限价单
     order = {
