@@ -8,7 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/caffeinate</string><string>-i</string>
-    <string>/Users/hhh/webull-quant/.venv/bin/python</string><string>-m</string><string>wquant</string>
+    <string>/Users/hhh/webull-quant/.venv/bin/python</string><string>-u</string><string>-m</string><string>wquant</string>
     <string>swing</string><string>tactical</string><string>--mode</string><string>webull</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/hhh/webull-quant</string>

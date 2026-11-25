@@ -2,6 +2,7 @@ webull-openapi-python-sdk>=3.0.4
 anthropic>=2.6.0
 pydantic>=2
 pandas>=2.0
+exchange-calendars>=4.5,<5
 numpy>=1.24
 pyyaml>=6
 python-dotenv>=1.0

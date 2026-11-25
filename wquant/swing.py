@@ -41,10 +41,26 @@ ENSEMBLE = (
     SwingParams(rule="ema", fast=10, slow=30, long_only=True),
 )
 
+ENSEMBLE_BOTH = (
+    SwingParams(rule="donchian", n_entry=20, n_exit=10, long_only=False),
+    SwingParams(rule="sma_mom", sma=50, mom=20, long_only=False),
+    SwingParams(rule="ema", fast=10, slow=30, long_only=False),
+)
+
 
 def ensemble_weight(idx: pd.DataFrame, members=ENSEMBLE) -> pd.Series:
     """组合：每条规则管 1/N 仓位，返回 0~1 的多头权重（几条规则看多）。"""
     return sum(target_series(idx, m).clip(lower=0) for m in members) / len(members)
+
+
+def ensemble_votes(idx: pd.DataFrame, members=ENSEMBLE_BOTH) -> pd.Series:
+    """三票制双向投票：每条规则投 +1（多）/ 0（中性）/ -1（空），返回总票数（-3 ~ +3）。"""
+    return sum(target_series(idx, m) for m in members).astype(int)
+
+
+def trend_regime(votes: int) -> int:
+    """总票数映射为趋势状态：>= +2 上涨(+1)，<= -2 下跌(-1)，其余震荡过渡(0)。"""
+    return 1 if votes >= 2 else (-1 if votes <= -2 else 0)
 
 
 def target_series(idx: pd.DataFrame, p: SwingParams) -> pd.Series:

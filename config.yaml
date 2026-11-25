@@ -123,6 +123,15 @@ backtest:
   slippage_bps: 5
   bars: 1200                   # Webull 单次最多 1200 根日线（约 4.7 年）
 
+# 常规时段 5 分钟波段策略，scalp backtest 与 scalp paper 共用
+scalp:
+  capital: 3000                # 独立模拟本金（美元）
+  notional: 1000               # 每笔最多使用的现金（美元），只买整股
+  max_trades: 12               # 每个交易日最多开仓次数
+  spread_bps: 4                # 假设的完整买卖点差，每次成交计入一半
+  slippage_bps: 3              # 每次成交的额外滑点，单位 bp
+  fee_per_order: 0.10          # 每次成交的模拟费用（美元）
+
 # ===== 半导体短线系统（SOXL / SOXS）=====
 # 战术层：夜盘 4 个检查时点，SOXL 相对昨收 ≥±3% 且 KOSPI 综合指数同方向 ≥1% → 当天顺势买 SOXL / SOXS，
 #         仓位按信号强弱 33%～66%；盘前 / 常规时段盈利加仓到 130%；止损 6%、加仓后回撤 6% 止盈，卖出后反弹 3% 买回（不限次数）；
@@ -143,51 +152,48 @@ swing:
     korea: KOSPI
     korea_confirm: 0.01      # KOSPI 当天同方向 ≥1%
     capital: 3000            # 系统本金（独立记账，和沙盒账户里的几千万虚拟资金无关）
-    position_frac: 0.33      # 固定仓位模式（sizing.mode: fixed）时用
-    stop_pct: 0.06           # 软件止损：跌破持仓均价 6%
+    position_frac: 1.0       # 最高收益全仓版（100% 仓位，不加仓）
+    stop_pct: 0.06           # 第 1 腿软件止损：跌破持仓均价 6%
     reentry: true
-    rebound_pct: 0.03        # 卖出（止损 / 止盈）后从最低点反弹 3% 就按原方向买回
-    max_reentries: null      # 一天买回次数：null = 不限
+    rebound_pct: 0.03        # 卖出后从最低点反弹 3% 就按原方向买回
+    max_reentries: 1         # 最多买回 1 次（日内只用 1 次 6% 窄止损）
+    reentry_stop_pct: 0.12   # 第 2 腿改用 12% 兜底止损（不设 7% 移动止盈，尾盘必平）
     last_reentry: "15:00"
-    # 融资与盈利加仓：夜盘不能融资（最多 100%）；盘前 / 常规时段最多 130%（需要账户对 SOXL/SOXS 有融资额度）
+    # 全仓模式不融资、不加仓
     max_frac_ovn: 1.0
-    max_frac: 1.3
-    add_step: 0.03           # 比上一次买入价再涨 3% 就加仓
-    add_frac: 0.33           # 每次加 33% 权益
-    add_from: "04:00"        # 盘前开始才加仓（北京冬令时 17:00）
-    add_last: "15:00"        # 15:00 ET 以后不再加仓
-    trail_after_add: 0.06    # 加过仓后，从持仓最高价回撤 6% 全部卖出（之后反弹 3% 再买回）
-    trail_pct: 0.07          # 移动止损（2026-11-09 加）：不管加没加仓，从持仓最高价回撤 7% 就卖，之后反弹 3% 买回
-    #   针对"整体还在涨但开盘后急跌"（如 11/6 盘前 +21% → 开盘后 +7.7%）。回测 6~10% 都不比不设差，7% 最好：
-    #   124 天 +274% / 回撤 -13.4%（不设 +243% / -14.7%）；最近 3 个月 KOSPI 5 分钟线 +66% / -8.4%（不设 +62% / -10.2%）
-    #   同时测过、但变差没用的：跌破常规时段 VWAP 离场或反手、跌破开盘区间离场、冲高回落反手做空、
-    #   美股开盘后顺势开仓、韩国收盘后 SOXL 猛涨猛跌就不看韩国
-    # 回测（124 天，本金 3000，旧的 4 时点逻辑，KOSPI 昨收修正前）：+184%，最大回撤 -18%，最差一天 -11.7%
+    max_frac: 1.0
+    add_step: null
+    add_frac: 0.33
+    add_from: "04:00"
+    add_last: "15:00"
+    trail_after_add: null
+    trail_pct: 0.07          # 第 1 腿移动止损：从持仓最高价回撤 7% 就卖，之后反弹 3% 买回
+    # 三票制双层动态切换（沙盒逻辑，研究回放结果见 README）：
+    #   SOXX 三票（Donchian 20/10 + SMA50/Mom20 + EMA 10/30）>= +2 票：核心层全仓持 SOXL 过夜，
+    #   挂单日 12% 急跌止损；止损后次日起盘中从低点反弹 5% 买回；等待期战术层仅顺势做多。
+    #   三票 < +2 票：清空核心仓，切入 5 分钟夜盘抢跑战术层（<= -2 票时只做空 SOXS，禁做多）。
+    trend_switch:
+      enabled: true
+      index: SOXX
+      core_symbol: SOXL
+      core_frac: 1.0
+      day_stop_pct: 0.12
+      rebuy_pct: 0.05
+      core_session_start: "09:30"
     poll_seconds: 60
     sides: [long, short]
     view_gate: true          # 用 Claude 当天的市场研判过滤方向
     view_min_confidence: 0.7 # 研判置信度达到这个值才限制方向
-    # 分时路径（2026-11-09 加）：21:00–04:00 ET 每分钟扫描，不只在 4 个时点看；同时看昨收以来的高低点
-    #   回测（124 天，本金 3000，KOSPI 昨收用官方收盘价）：+243%，最大回撤 -14.7%，最差一天 -9.1%（只看 4 个时点：+158% / -16.2% / -11.7%）
-    #   夜盘滑点按 0.3%：+209% / -14.3% / -7.6%（时点版 +156% / -15.4% / -11.8%）
-    #   最近 3 个月用 KOSPI 5 分钟线：+62% / -10.2%（时点版 +50% / -12.4%）；滑点 0.3% 时两者差不多（+51% vs +53%）
-    #   从 20:00 夜盘一开盘就扫描会变差（+175% / -22.4%），第一个小时噪音大，所以从 21:00 开始
-    #   追 V 形反转（从低点反弹 6~8% 就反手）、或者 SOXL / KOSPI 都按当天低点高点起算（-3% 拉到 0 算涨 3%）都明显变差，所以不用
     path:
       enabled: true
-      scan: continuous       # checkpoints = 只在 4 个时点看（旧逻辑）
+      scan: continuous       # 21:00–04:00 ET 每分钟连续扫描
       scan_from: "21:00"     # 北京冬令时 10:00
       scan_to: "04:00"       # 北京冬令时 17:00
-      vwap_filter: false     # 回测里略差
+      vwap_filter: false
       veto_pct: 0.06         # 想做空但已经从低点反弹 ≥6%（或想做多但已经从高点回落 ≥6%）→ 不做
-      reversal_pct: null     # 反转信号：关闭
-    # 动态仓位 = 33% × 信号强弱倍数，限制在 15%～80%
-    #   信号强弱倍数 = min(SOXL 涨跌 / 3%, KOSPI 涨跌 / 1%)，在 1～signal_cap 之间（全部用当天实时数据，没有滞后）
-    #   趋势效率（过去 10 天）有 4～6 天滞后、而且会压缩趋势反转时的交易，已关闭（use_trend_efficiency: false）
-    #   回测（124 天）：平均仓位 50%，+101%，最大回撤 -12.2%（固定 33%：+51% / -9.6%）
-    #   改成 mode: fixed 就回到固定 position_frac
+      reversal_pct: null
     sizing:
-      mode: dynamic
+      mode: fixed            # 100% 全仓（改回 dynamic 即恢复原 33%~66% 动态仓位）
       base: 0.33
       signal_cap: 2.0
       use_trend_efficiency: false
@@ -199,5 +205,46 @@ swing:
   order:
     type: LIMIT
     limit_offset_bps: 30     # 限价 = 最新价 ± 0.3%（夜盘 / 盘前价差大）
+    time_in_force: DAY
+    trading_session: ALL_DAY
+
+# ===== 三层每日开盘前公允价值系统（python -m wquant fair-value）=====
+fair_value:
+  peer_window: 60            # 第 1 层：同板块 + 大盘日收益因子回归窗口（交易日）
+  peer_horizon: 5            # 第 1 层：计算板块相对偏离的回溯锚点（交易日）
+  peer_reversion_frac: 0.50  # 第 1 层：短期偏离回归阻尼系数
+  peer_ridge_alpha: 2.0      # 第 1 层 Ridge 正则系数
+  stat_train_window: 252     # 第 2 层：短期量价模型滚动训练窗（交易日）
+  stat_horizon: 3            # 第 2 层：预测目标周期（交易日）
+  stat_ridge_alpha: 80.0     # 第 2 层 Ridge 正则系数（强正则防过拟合）
+  fund_pull_strength: 0.12   # 第 3 层：基本面锚向当日公允价的有界引力系数
+  fund_discount_rate: 0.08   # 第 3 层：分析师 12 个月目标价折现率
+  earnings_window_days: 3    # 财报前后 N 个交易日自动降权历史板块回归
+  weights:
+    peer: 0.35               # 第 1 层基础权重（再按拟合优度 R² 动态缩放）
+    stat: 0.50               # 第 2 层基础权重
+    fund: 0.15               # 第 3 层基础权重（ETF 自动跳过）
+  backtest_eval_days: 500    # Walk-Forward 回测评估交易日数
+  backtest_retrain_every: 5  # 回测中第 2 层重训间隔（交易日）
+
+# ===== 动态公允价反复做 T（python -m wquant fv-t）=====
+# 独立模拟账本（state/fv_t_book_<env>.json），与 swing（SOXL/SOXS）完全隔离
+fv_t:
+  groups: [semis, memory, optical]   # 回测多空差最强的三大高联动板块
+  capital: 10000                     # 独立模拟本金（美元）
+  notional_per_trade: 2500           # 单笔低买金额上限（美元）
+  max_positions: 4                   # 最多同时持有 4 只做 T 仓位
+  max_per_group: 2                   # 同一板块最多 2 只
+  entry_z: -0.60                     # 低于动态公允价 ≥0.60σ 时低吸
+  exit_z: 0.10                       # 回归到动态公允价上方 +0.10σ 时高卖止盈
+  stop_pct: 0.06                     # 单笔硬止损 -6%
+  max_hold_days: 5                   # 最长持有 5 个交易日
+  require_soxx_above: -2             # SOXX 三票制 <= -2（熊市下跌趋势）时清仓并停买
+  kospi_crash_pct: -2.0              # KOSPI 急跌 <= -2% 时暂停新开多单
+  daily_loss_pct: 0.03               # 当日已实现亏损超 3% 熔断停开新仓
+  poll_minutes: 15                   # --watch 常规时段轮询间隔（分钟）
+  order:
+    type: LIMIT
+    limit_offset_bps: 20
     time_in_force: DAY
     trading_session: ALL_DAY

@@ -11,3 +11,6 @@ KILL_SWITCH
 decisions/
 .DS_Store
 data/intraday/
+data/news/
+data/regime/
+data/fair_value/

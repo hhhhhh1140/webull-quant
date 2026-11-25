@@ -21,7 +21,12 @@ def _to_frame(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["t"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert("America/New_York")
+    stamps = df["time"]
+    if pd.api.types.is_numeric_dtype(stamps) or stamps.astype(str).str.fullmatch(r"\d+").all():
+        times = pd.to_datetime(stamps.astype("int64"), unit="ms", utc=True)
+    else:
+        times = pd.to_datetime(stamps, utc=True, format="mixed")
+    df["t"] = times.dt.tz_convert("America/New_York")
     for c in ("open", "high", "low", "close", "volume"):
         df[c] = df[c].astype(float)
     df = df.rename(columns={"trading_session": "session"})
@@ -66,7 +71,8 @@ def adjust_splits(df: pd.DataFrame, threshold: float = 2.5) -> pd.DataFrame:
 def download(client, symbol: str, timespan: str = "M5", days: int = 178, pause: float = 0.3) -> pd.DataFrame:
     """从现在往回翻页，直到 days 天前（接口限制 180 天）。与已有文件合并。"""
     from .webull_client import _json, _unwrap_list
-    stop = datetime.now(timezone.utc) - timedelta(days=days)
+    started = datetime.now(timezone.utc)
+    stop = started - timedelta(days=days)
     end = None
     parts = []
     while True:
@@ -85,9 +91,18 @@ def download(client, symbol: str, timespan: str = "M5", days: int = 178, pause: 
         end = first - timedelta(seconds=1)
         time.sleep(pause)
     new = pd.concat(parts) if parts else pd.DataFrame()
-    old = load(symbol, timespan)
+    # Cache raw bars. Adjusting old rows before merging raw pages mixes price
+    # scales across incremental downloads, especially for SOXS reverse splits.
+    old = load(symbol, timespan, adjust=False)
     all_ = pd.concat([old, new]) if not old.empty else new
+    if all_.empty:
+        return all_
     all_ = all_[~all_.index.duplicated(keep="last")].sort_index()
+    if timespan.startswith("M") and timespan[1:].isdigit():
+        # An unfinished 15:55 M5 must not become a cached "complete day"
+        # when replaying this file after the close.
+        last_closed_start = started - timedelta(minutes=int(timespan[1:]))
+        all_ = all_.loc[all_.index <= last_closed_start]
     DIR.mkdir(parents=True, exist_ok=True)
     all_.to_csv(path(symbol, timespan))
     return all_

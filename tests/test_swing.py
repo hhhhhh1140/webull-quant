@@ -386,3 +386,96 @@ def test_trailing_stop_from_peak_then_rebuy(env):
         md.prices["SOXL"] = px
         st = SL.tactical_step(s, md, br, books, st, at(hh))
     assert st.reentries == 1 and br.orders[-1][:2] == ("SOXL", "BUY")
+
+
+def _trend_df(up: bool, n: int = 120):
+    idx = pd.bdate_range("2026-01-01", periods=n)
+    c = np.linspace(100, 180, n) if up else np.linspace(180, 100, n)
+    return pd.DataFrame({"open": c, "high": c * 1.01, "low": c * 0.99, "close": c}, index=idx)
+
+
+def _dual_settings():
+    return Settings(raw={"swing": {"tactical": {
+        "poll_seconds": 60, "position_frac": 1.0, "sizing": {"mode": "fixed"},
+        "add_step": None, "trail_after_add": None, "trail_pct": 0.07,
+        "stop_pct": 0.06, "reentry": True, "rebound_pct": 0.03,
+        "max_reentries": 1, "reentry_stop_pct": 0.12,
+        "trend_switch": {"enabled": True, "index": "SOXX", "core_symbol": "SOXL",
+                         "core_frac": 1.0, "day_stop_pct": 0.12, "rebuy_pct": 0.05,
+                         "core_session_start": "09:30"},
+    }}})
+
+
+def test_dual_uptrend_core_stop_and_next_day_rebuy(env):
+    _, books, _ = env
+    s = _dual_settings()
+    md = FakeMarket({"SOXL": 100.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=0.02)
+    md.daily_df = _trend_df(up=True)
+    br = FakeBroker()
+
+    # 第 1 天：上涨趋势 → 09:30 买核心 SOXL，15:55 保留过夜不卖
+    st1 = SL.TacState(day=str(DAY))
+    st1 = SL.tactical_step(s, md, br, books, st1, at("21:00"))
+    assert st1.trend_regime == 1 and st1.core_active_today and not br.orders
+    st1 = SL.tactical_step(s, md, br, books, st1, at("09:30"))
+    assert books.qty("core", "SOXL") == 30 and br.orders[-1][:2] == ("SOXL", "BUY")
+    st1 = SL.tactical_step(s, md, br, books, st1, at("15:55"))
+    assert st1.done and books.qty("core", "SOXL") == 30
+
+    # 第 2 天：相对昨收 100 急跌 -12.5% → 盘中触发单日 12% 止损，当日结束不再买回
+    day2 = DAY + timedelta(days=1)
+    st2 = SL.TacState(day=str(day2))
+    md.prices["SOXL"] = 87.5
+    st2 = SL.tactical_step(s, md, br, books, st2, at("10:00", day2))
+    assert st2.done and books.qty("core", "SOXL") == 0
+    cst = SL._load_core_state("uat")
+    assert cst.stopped and cst.stopped_day == str(day2)
+
+    # 第 3 天：止损次日起，盘中从低点 85 反弹 +5% (89.3) → 立刻买回核心 SOXL
+    day3 = DAY + timedelta(days=2)
+    st3 = SL.TacState(day=str(day3))
+    md.prices["SOXL"] = 85.0
+    st3 = SL.tactical_step(s, md, br, books, st3, at("09:30", day3))
+    assert books.qty("core", "SOXL") == 0 and not st3.done
+    md.prices["SOXL"] = 89.5
+    st3 = SL.tactical_step(s, md, br, books, st3, at("10:30", day3))
+    assert books.qty("core", "SOXL") > 0 and br.orders[-1][:2] == ("SOXL", "BUY")
+    assert not SL._load_core_state("uat").stopped
+
+
+def test_dual_downtrend_liquidates_core_blocks_long_and_uses_leg2_stop(env):
+    _, books, _ = env
+    s = _dual_settings()
+    books.add("core", "SOXL", 20)
+    SL._save_core_state("uat", SL.CoreState(holding=True, entry=100.0))
+
+    # 趋势转跌：先清空核心 SOXL，再拦截做多信号，只允许做空 SOXS
+    md = FakeMarket({"SOXL": 105.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=0.02)
+    md.daily_df = _trend_df(up=False)
+    br = FakeBroker()
+    st = SL.tactical_step(s, md, br, books, SL.TacState(day=str(DAY)), at("21:00"))
+    assert st.trend_regime == -1 and books.qty("core", "SOXL") == 0
+    assert br.orders[0][:2] == ("SOXL", "SELL") and len(br.orders) == 1  # 做多信号被三票下跌趋势拦截
+
+    # 换成做空信号：买 SOXS → 第 1 腿 6% 止损 → 反弹 3% 买回 → 第 2 腿忽略 6% 止损，跌到 12% 才兜底止损
+    md2 = FakeMarket({"SOXL": 95.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=-0.02)
+    md2.daily_df = _trend_df(up=False)
+    day2 = DAY + timedelta(days=1)
+    br2 = FakeBroker()
+    st2 = SL.tactical_step(s, md2, br2, books, SL.TacState(day=str(day2)), at("21:00", day2))
+    assert br2.orders[-1][:2] == ("SOXS", "BUY")
+    md2.prices["SOXS"] = 46.9                                           # -6.2% → 第 1 腿止损
+    st2 = SL.tactical_step(s, md2, br2, books, st2, at("22:00", day2))
+    assert st2.stopped and st2.qty == 0
+    md2.prices["SOXS"] = 48.5                                           # 反弹 >3% → 第 2 腿买回
+    st2 = SL.tactical_step(s, md2, br2, books, st2, at("23:00", day2))
+    assert st2.reentries == 1 and st2.qty > 0
+    md2.prices["SOXS"] = 44.5                                           # 较 48.5 跌 -8.2%（超 6% 但未到 12%）→ 不止损！
+    st2 = SL.tactical_step(s, md2, br2, books, st2, at("10:00", day2))
+    assert st2.qty > 0
+    md2.prices["SOXS"] = 42.5                                           # 跌 -12.4% → 触发第 2 腿 12% 兜底止损，且不再买回
+    st2 = SL.tactical_step(s, md2, br2, books, st2, at("11:00", day2))
+    assert st2.qty == 0 and "第 2 腿兜底止损" in st2.log[-1]
+    md2.prices["SOXS"] = 46.0
+    st2 = SL.tactical_step(s, md2, br2, books, st2, at("12:00", day2))
+    assert st2.qty == 0 and st2.reentries == 1                          # max_reentries=1，不再开第 3 腿

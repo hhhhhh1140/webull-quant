@@ -265,6 +265,91 @@ def cmd_intraday(args, s):
     return 0
 
 
+def cmd_scalp(args, s):
+    from .scalp import ScalpParams
+    try:
+        params = ScalpParams(**s.section("scalp"))
+    except (TypeError, ValueError) as exc:
+        print(f"scalp 配置无效，{exc}", file=sys.stderr)
+        return 2
+    if (args.action == "paper" or args.fetch) and not s.has_webull_credentials:
+        print("当前 Webull 环境缺少行情凭据，请检查项目的 .env 配置", file=sys.stderr)
+        return 1
+    if args.action == "paper":
+        from .scalp_paper import run_paper
+        return run_paper(s, params, watch=args.watch)
+    from .intraday_data import download, load
+    from .scalp_data import sessions
+    from .scalp_report import print_report
+    if args.fetch:
+        from .webull_client import WebullClient
+        try:
+            client = WebullClient(s)
+            for symbol in ("SOXL", "SOXS"):
+                download(client, symbol, "M5")
+        except Exception as exc:
+            print(f"Webull 分钟线更新失败（{type(exc).__name__}），可用 scalp backtest 回放本地缓存", file=sys.stderr)
+            return 1
+    long_bars = load("SOXL", adjust=False)
+    short_bars = load("SOXS", adjust=False)
+    if long_bars.empty or short_bars.empty:
+        print("缺少 SOXL / SOXS 分钟线，请运行 scalp backtest --fetch")
+        return 1
+    observed = set(long_bars.index[long_bars.session == "RTH"].date)
+    observed.update(short_bars.index[short_bars.session == "RTH"].date)
+    days = list(sessions(long_bars, short_bars))
+    if not days:
+        print("两只 ETF 的缓存中没有完整对齐的常规交易日")
+        return 1
+    print(f"SOXL / SOXS 常规时段 5 分钟线，{days[0][0]} 至 {days[-1][0]}。有行情的 {len(observed)} 日中纳入 {len(days)} 日。")
+    print(f"初始本金 ${params.capital:,.2f}，每次最多 ${params.notional:,.2f}，完整点差 {params.spread_bps:g} bp，"
+          f"单边滑点 {params.slippage_bps:g} bp，每次成交费用 ${params.fee_per_order:.2f}。")
+    print_report(days, params, args.trades)
+    return 0
+
+
+def cmd_pair_study(args, s):
+    from pathlib import Path
+    from .intraday_data import DIR
+    from .pair_data import study_days
+    from .pair_study import compare
+    forward = Path(args.forward_dir) if args.forward_dir else DIR / "pair_forward"
+    if args.forward_dir and not forward.is_dir():
+        print(f"找不到新增行情目录 {forward}", file=sys.stderr)
+        return 1
+    try:
+        if args.bear_rally or args.trend_close:
+            if args.news:
+                raise ValueError("--news 需要与 --sizing 或 --entry-times 配合使用")
+            if args.trend_close:
+                from .trend_close import compare_close as run_study
+            else:
+                from .bear_rally import compare_rallies as run_study
+            run_study(forward if forward.is_dir() else None, args.trades)
+            return 0
+        days = study_days(forward if forward.is_dir() else None)
+        if args.sizing or args.entry_times:
+            from .news_capture import DEFAULT_ARCHIVE
+            news = args.news or (DEFAULT_ARCHIVE if DEFAULT_ARCHIVE.exists() else None)
+            if args.entry_times:
+                from .clock_study import compare_clocks
+                compare_clocks(days, news, args.trades)
+            else:
+                from .pair_sizing import compare_sizing
+                compare_sizing(days, news, args.trades)
+        elif args.news:
+            raise ValueError("--news 需要与 --sizing 或 --entry-times 配合使用")
+        elif args.night_pullback:
+            from .night_pullback import compare_pullbacks
+            compare_pullbacks(days, args.trades)
+        else:
+            compare(days, args.trades)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"策略比较未完成，{exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_overnight(args, s):
     """夜盘方向 → 顺势持有 的跨时段回测。"""
     from dataclasses import replace
@@ -300,9 +385,17 @@ def cmd_swing(args, s):
     books = SL.Books(s.environment)
     if args.what == "status":
         print(f"环境 {s.environment}  系统权益 ${SL.system_equity(s):,.2f}  账本 {books.data}")
+        if (cfg["tactical"].get("trend_switch") or {}).get("enabled"):
+            cst = SL._load_core_state(s.environment)
+            print(f"双层状态: 持核心={cst.holding} 均价={cst.entry:.2f} 止损冷却={cst.stopped}"
+                  f"({cst.stopped_day or '-'}, 低点={cst.low_since_stop}) 最近三票={cst.last_votes}")
         day = SL.trading_day(now())
         st = SL._load_state(s.environment, day)
         print(f"战术层 {day}: " + ("\n  ".join(st.log) if st.log else "还没开始"))
+        return 0
+    if args.what == "study":
+        from .swing_study import main as study_main
+        study_main(fetch=getattr(args, "fetch", False))
         return 0
     if args.what == "backtest":
         from .data import load_bars
@@ -313,7 +406,17 @@ def cmd_swing(args, s):
         print("核心层:", r.metrics, "按年", yearly(r.equity))
         return 0
     from .webull_client import WebullClient
-    client = WebullClient(s)
+    import time as _time
+    client = None
+    for attempt in range(1, 11):
+        try:
+            client = WebullClient(s)
+            break
+        except Exception as e:
+            if attempt == 10:
+                raise
+            print(f"[swing] 连接 Webull 失败（第 {attempt}/10 次），10 秒后重试：{e}")
+            _time.sleep(10)
     md = SL.WebullMarket(client, now)
     broker = SL.make_broker(s, mode, args.confirm_live, cfg["order"])
     dry = mode != "webull"
@@ -339,6 +442,162 @@ def cmd_status(args, s):
     print(f"  候选 {len(packet['candidates'])} 个（生成于 {packet['generated_at']}，环境 {packet['environment']}）")
     print(f"  审核结论: {'已写入' if dec.exists() else '还没有'}")
     return 0
+
+
+def cmd_regime_bt(args, s) -> int:
+    from .regime_bt import main as regime_main
+    regime_main(fetch=args.fetch)
+    return 0
+
+
+def cmd_fair_value(args, s) -> int:
+    from .fair_value import backtest_fair_value, compute_daily_fair_values, merge_cfg
+    from .fair_value_data import (
+        load_event_context,
+        load_fundamentals,
+        load_fv_bars,
+        load_regime_context,
+        load_webull_live_quotes,
+    )
+    from .fair_value_report import format_backtest_markdown, format_terminal_table, save_daily_report
+
+    fv_cfg = merge_cfg(s.section("fair_value"))
+    target_syms = [x.upper() for x in (args.symbols or s.universe)]
+    fetch_syms = list(dict.fromkeys(list(s.universe) + ["SPY", "QQQ", "SOXX", "SOXL"] + target_syms))
+
+    print(f"[fair-value] 加载行情（来源: {args.source}，共 {len(fetch_syms)} 只）...")
+    bars = load_fv_bars(s, fetch_syms, source=args.source, refresh=not args.no_fetch)
+    if not bars:
+        print("✗ 没有可用日线行情数据")
+        return 1
+
+    bt_summary = None
+    if args.backtest or args.backtest_only:
+        print("[fair-value] 运行滚动样本外回测（Walk-Forward，无未来函数）...")
+        bt_summary = backtest_fair_value(bars, s.groups, symbols=target_syms, cfg=fv_cfg)
+        print()
+        print(format_backtest_markdown(bt_summary))
+        if args.backtest_only:
+            return 0
+        print()
+
+    fundamentals = {}
+    live_quotes = {}
+    if args.source != "synthetic":
+        refresh_fund = (not args.no_fund_fetch) and (args.source != "cache")
+        fundamentals = load_fundamentals(fetch_syms, refresh=refresh_fund)
+        if not args.no_live and args.source != "cache":
+            print("[fair-value] 拉取 Webull 24 小时实时报价（含夜盘 OVN / 盘前 PRE）...")
+            live_quotes = load_webull_live_quotes(s, fetch_syms)
+            if live_quotes:
+                sessions = sorted({v["session"] for v in live_quotes.values()})
+                print(f"[fair-value] 已获取 {len(live_quotes)} 只 Webull 实时报价（时段: {'/'.join(sessions)}）")
+
+    regime_ctx = load_regime_context(
+        bars=bars,
+        live_quotes=live_quotes,
+        refresh_kospi=(not args.no_live) and (args.source not in ("cache", "synthetic")),
+    )
+    ev_ctx = load_event_context(
+        fundamentals=fundamentals,
+        earnings_window_days=int(fv_cfg["earnings_window_days"]),
+    )
+    results = compute_daily_fair_values(
+        bars=bars,
+        groups=s.groups,
+        symbols=target_syms,
+        fundamentals=fundamentals,
+        event_context=ev_ctx,
+        live_quotes=live_quotes,
+        regime_context=regime_ctx,
+        cfg=fv_cfg,
+    )
+    if not results:
+        print("✗ 未能计算出有效估值结果（请检查行情数据长度）")
+        return 1
+
+    print()
+    print(format_terminal_table(results, event_context=ev_ctx, regime_context=regime_ctx))
+    if not args.no_save:
+        json_path, md_path = save_daily_report(
+            results,
+            event_context=ev_ctx,
+            regime_context=regime_ctx,
+            source=f"{args.source}+webull_live" if live_quotes else args.source,
+            backtest_summary=bt_summary,
+        )
+        print(f"\n✓ 每日估值报告已保存:\n  Markdown: {md_path}\n  JSON:     {json_path}")
+    return 0
+
+
+def cmd_fv_t(args, s) -> int:
+    from .fair_value_data import load_fv_bars
+    from .fv_t import FvTParams, run_fv_t_backtest, run_swing_t_backtest
+    from .fv_t_data import fetch_m5_universe, fv_t_symbols
+    from .fv_t_live import fv_t_cfg, params_from_cfg, print_fv_t_status, run_fv_t_once, watch_fv_t
+
+    cfg = fv_t_cfg(s)
+    syms, grp_map = fv_t_symbols(s, cfg["groups"])
+
+    if args.action == "status":
+        print_fv_t_status(s, mode=args.mode or "webull")
+        return 0
+
+    if args.action == "backtest":
+        fetch_syms = list(dict.fromkeys(["SPY", "QQQ", "SOXX"] + syms))
+        bars = load_fv_bars(s, fetch_syms, source=args.source, refresh=args.fetch)
+        p = params_from_cfg(cfg)
+        res = run_swing_t_backtest(bars, syms, grp_map, p)
+        if res.get("error"):
+            print(f"✗ 回测失败: {res['error']}")
+            return 1
+        print("=== 1~5日动态公允价波段做 T 回测（1x 成本: 12bp 双边 + $0.20）===")
+        print(json.dumps({k: v for k, v in res.items() if k != "recent_trades"}, ensure_ascii=False, indent=2))
+        if args.stress:
+            p2 = params_from_cfg(cfg)
+            p2.spread_bps *= 2.0
+            p2.slippage_bps *= 2.0
+            p2.fee_per_order *= 2.0
+            res2 = run_swing_t_backtest(bars, syms, grp_map, p2)
+            print("\n=== 双倍成本压力测试（24bp 双边 + $0.40）===")
+            summary2 = {k: res2.get(k) for k in (
+                "total_pnl", "total_return_pct", "first_half_return_pct", "second_half_return_pct",
+                "last_40d_return_pct", "max_drawdown_pct", "sharpe", "trades", "win_rate_pct", "profit_factor",
+            )}
+            print(json.dumps(summary2, ensure_ascii=False, indent=2))
+        if args.trades:
+            print(f"\n最近 {args.trades} 笔做 T 记录:")
+            for t in res.get("recent_trades", [])[-args.trades:]:
+                print(
+                    f"  {t['entry_date']}→{t['exit_date']} {t['symbol']:<5} {t['qty']:>4d}股 "
+                    f"${t['entry_price']:.2f}→${t['exit_price']:.2f} PnL ${t['pnl']:+7.2f} ({t['ret_pct']:+.2f}%) [{t['reason']}]"
+                )
+        return 0
+
+    if args.action == "m5-backtest":
+        bars = fetch_m5_universe(s, syms, days=args.days, refresh=args.fetch)
+        res = run_fv_t_backtest(bars, syms, grp_map, FvTParams())
+        print("=== 5分钟日内动态公允价做 T 回测（对比验证）===")
+        print(json.dumps({k: v for k, v in res.items() if k != "recent_trades"}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.action == "run":
+        mode = args.mode or "dry_run"
+        if args.watch:
+            watch_fv_t(s, mode=mode, confirm_live=args.confirm_live, source=args.source, poll_minutes=args.poll)
+            return 0
+        run_fv_t_once(
+            s,
+            mode=mode,
+            confirm_live=args.confirm_live,
+            source=args.source,
+            no_fetch=args.no_fetch,
+            no_fund_fetch=args.no_fund_fetch,
+            no_live=args.no_live,
+        )
+        return 0
+
+    return 1
 
 
 def main(argv=None) -> int:
@@ -384,6 +643,25 @@ def main(argv=None) -> int:
     it.add_argument("--short", default="SOXS")
     it.add_argument("--ref", default="QQQ")
     it.add_argument("--slippage", type=float, default=0.05, help="单边滑点（%）")
+    scalp = sub.add_parser("scalp", help="SOXL / SOXS 常规时段 5 分钟波段交易")
+    actions = scalp.add_subparsers(dest="action", required=True)
+    sb = actions.add_parser("backtest", help="逐日回放、分段验证与双倍成本压力测试")
+    sb.add_argument("--fetch", action="store_true", help="先从 Webull 更新两只 ETF 的分钟线")
+    sb.add_argument("--trades", type=int, default=0, help="打印最近 N 笔完整交易")
+    sp = actions.add_parser("paper", help="读取 Webull 分时行情，在本地模拟成交")
+    sp.add_argument("--watch", action="store_true", help="持续轮询行情，Ctrl-C 停止")
+    pair = sub.add_parser("pair-study", help="比较仅交易 SOXL/SOXS 的夜盘及日内策略")
+    pair.add_argument("--forward-dir", help="新增验证行情目录，默认读取 data/intraday/pair_forward")
+    pair.add_argument("--trades", type=int, default=0, help="展示所选策略最近 N 笔历史模拟成交")
+    study_mode = pair.add_mutually_exclusive_group()
+    study_mode.add_argument("--sizing", action="store_true", help="回放 04:00 条件全仓及消息过滤规则")
+    study_mode.add_argument("--entry-times", action="store_true", help="比较固定进场时点并检验延迟成交与仓位")
+    study_mode.add_argument("--night-pullback", action="store_true", help="按行业趋势比较夜盘 VWAP 附近及下方入场")
+    study_mode.add_argument("--bear-rally", action="store_true", help="回测下跌趋势中夜盘拉高、SOXS 均价下方买入")
+    study_mode.add_argument("--trend-close", action="store_true", help="顺趋势单边夜盘低吸，持有到常规盘尾盘退出")
+    pair.add_argument("--news", help="带公布和首次可用时间的行业新闻归档，默认读取 news-record 的归档")
+    from .news_capture import add_arguments, cmd_news_record
+    add_arguments(sub)
     on = sub.add_parser("overnight-bt", help="夜盘方向 → 顺势持有 的跨时段回测")
     on.add_argument("--fetch", action="store_true")
     on.add_argument("--long", default="SOXL")
@@ -394,10 +672,44 @@ def main(argv=None) -> int:
     on.add_argument("--stop", type=float, default=6.0, help="止损（%%）")
     on.add_argument("--no-reentry", action="store_true")
     on.add_argument("--korea", type=float, default=None, help="要求 EWY 同方向至少多少（%%）")
-    sw = sub.add_parser("swing", help="半导体波段系统：core 每日调仓 / tactical 当天夜盘战术（会一直运行到收盘）/ status / backtest")
-    sw.add_argument("what", choices=["core", "tactical", "status", "backtest"])
+    sw = sub.add_parser("swing", help="半导体波段系统：core 每日调仓 / tactical 当天夜盘战术 / status / backtest / study")
+    sw.add_argument("what", choices=["core", "tactical", "status", "backtest", "study"])
+    sw.add_argument("--fetch", action="store_true", help="study 用：先更新 Yahoo 日线")
     sw.add_argument("--mode", choices=["dry_run", "webull"], help="默认 dry_run 只打印；webull 才下单")
     sw.add_argument("--confirm-live", action="store_true")
+    rg = sub.add_parser("regime-bt", help="趋势研判回测：上涨只做 SOXL、下跌只做 SOXS（1996 起，含利率周期和 VIX）")
+    rg.add_argument("--fetch", action="store_true", help="先从 Yahoo 更新 ^SOX、SOXL、SOXS、VIX、美债收益率日线")
+    fv = sub.add_parser("fair-value", help="三层每日开盘前公允价值报告（板块联动 + 量价均衡 + 基本面锚）")
+    fv.add_argument("symbols", nargs="*", help="指定标的，默认读取 config.yaml 全部 universe")
+    fv.add_argument("--source", choices=["yahoo", "webull", "cache", "synthetic"], default="yahoo",
+                    help="日线来源，默认 yahoo（免密钥、自动前复权）")
+    fv.add_argument("--no-fetch", action="store_true", help="日线仅读本地缓存，不联网更新")
+    fv.add_argument("--no-fund-fetch", action="store_true", help="基本面/盘前价仅读本地缓存，不联网更新")
+    fv.add_argument("--no-live", action="store_true", help="不拉取 Webull 24h 夜盘实时价与 KOSPI 实时涨跌")
+    fv.add_argument("--backtest", action="store_true", help="同时运行滚动样本外（Walk-Forward）回测验证")
+    fv.add_argument("--backtest-only", action="store_true", help="仅运行历史样本外回测，不生成今日报告")
+    fv.add_argument("--no-save", action="store_true", help="只打印终端表格，不写入 decisions/<日期>/fair_value.*")
+    fvt = sub.add_parser("fv-t", help="动态公允价低买高卖做 T（独立模拟账本 + Webull UAT 沙盒下单）")
+    fvt_sub = fvt.add_subparsers(dest="action", required=True)
+    fvt_bt = fvt_sub.add_parser("backtest", help="1~5日公允价波段做 T 严格样本外回测（含双倍成本压力测试）")
+    fvt_bt.add_argument("--source", choices=["yahoo", "webull", "cache", "synthetic"], default="yahoo")
+    fvt_bt.add_argument("--fetch", action="store_true", help="先联网更新日线")
+    fvt_bt.add_argument("--stress", action="store_true", help="附带双倍成本压力测试")
+    fvt_bt.add_argument("--trades", type=int, default=0, help="打印最近 N 笔交易")
+    fvt_m5 = fvt_sub.add_parser("m5-backtest", help="5分钟日内公允价做 T 对比回测（读 Webull M5 缓存）")
+    fvt_m5.add_argument("--fetch", action="store_true", help="先从 Webull 更新 5 分钟 K 线")
+    fvt_m5.add_argument("--days", type=int, default=90)
+    fvt_run = fvt_sub.add_parser("run", help="执行公允价低买高卖做 T（默认 dry_run；--mode webull 才往 UAT 沙盒下单）")
+    fvt_run.add_argument("--mode", choices=["dry_run", "webull"], default="dry_run")
+    fvt_run.add_argument("--confirm-live", action="store_true", help="实盘下单最后确认（UAT 沙盒不需要）")
+    fvt_run.add_argument("--source", choices=["yahoo", "webull", "cache", "synthetic"], default="yahoo")
+    fvt_run.add_argument("--no-fetch", action="store_true")
+    fvt_run.add_argument("--no-fund-fetch", action="store_true")
+    fvt_run.add_argument("--no-live", action="store_true")
+    fvt_run.add_argument("--watch", action="store_true", help="美股常规时段持续轮询（盘中回归公允价立即止盈轮动）")
+    fvt_run.add_argument("--poll", type=int, default=None, help="轮询间隔（分钟），默认读 config.yaml")
+    fvt_st = fvt_sub.add_parser("status", help="查看 fv-t 独立模拟账本持仓与已实现盈亏")
+    fvt_st.add_argument("--mode", choices=["dry_run", "webull"], default="webull")
     sub.add_parser("compare", help="个股系统 vs SOXL/SOXS 战术层：收益率、回撤、交易次数并排对比")
     db = sub.add_parser("dashboard", help="启动本地网页仪表盘（只读）")
     db.add_argument("--port", type=int, default=8765)
@@ -405,7 +717,9 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     s = load_settings(args.config)
     cmds = {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
-            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "compare": cmd_compare, "overnight-bt": cmd_overnight, "swing": cmd_swing}
+            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "compare": cmd_compare, "overnight-bt": cmd_overnight, "swing": cmd_swing,
+            "scalp": cmd_scalp, "pair-study": cmd_pair_study, "news-record": cmd_news_record,
+            "regime-bt": cmd_regime_bt, "fair-value": cmd_fair_value, "fv-t": cmd_fv_t}
     return cmds[args.cmd](args, s)
 
 

@@ -30,7 +30,8 @@ events:
     time_et: "08:30"
     name: 10 月 PPI
     importance: medium
-    source: https://www.bls.gov/schedule/news_release/ppi.htm
+    consensus: {headline_mom: "+0.4%（道琼斯共识，11/11）", core_mom: "+0.3%", headline_yoy: "6.6%（9 月 6.3%，若兑现为 2022 年 11 月以来最高）", core_yoy: "约 5.0%", prior_mom: "整体 +1.3% / 核心 +0.7%（Continuum Economics 11/13 前瞻同为 +0.4% / +0.3%，https://continuumeconomics.com/a/df30188a/preview-due-november-13-us-october-ppi-firm-if-less-so-than-in-september）"}
+    source: https://www.stocktitan.net/articles/october-2026-ppi-preview-yearly-rate
   - date: 2026-11-17
     time_et: "08:30"
     name: 10 月零售销售
@@ -45,5 +46,5 @@ events:
     time_et: "14:00"
     name: FOMC 利率决议（12/8-9，含点阵图）
     importance: high
-    consensus: {note: "10 月 CPI 偏热后，期货定价 12 月加息约 97%（CappNotes 11/10 收盘，https://cappnotes.substack.com/p/closing-look-tuesday-november-10）；BofA 预期加息"}
+    consensus: {note: "10 月 CPI 偏热后，期货定价 12 月加息约 97%（CappNotes 11/10 收盘，https://cappnotes.substack.com/p/closing-look-tuesday-november-10）；BofA 预期加息；11/11 收盘期货已完全定价加息 25bp，CME 另有约 10% 概率加 50bp（https://cappnotes.substack.com/p/closing-look-wednesday-november-11）；11/12 Waller 支持加 25bp、通胀更热可加 50bp，CME 定价 25bp 超过 90%、50bp 略低于 10%，10 年期收 5.10%（https://cappnotes.substack.com/p/closing-look-thursday-november-12）"}
     source: https://www.federalreserve.gov/newsevents/2026-december.htm
