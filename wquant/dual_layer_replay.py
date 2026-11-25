@@ -232,29 +232,6 @@ class Intraday:
                 and v["SOXL"].session == "ATH"]
 
 
-def load_views(source):
-    snapshot = source / "market_views.json"
-    if snapshot.exists():
-        return {date.fromisoformat(day): [(pd.Timestamp(t), set(sides)) for t, sides in items]
-                for day, items in json.loads(snapshot.read_text()).items()}
-    views = {}
-    for p in (ROOT / "decisions").glob("*/decisions*.json"):
-        j = json.loads(p.read_text())
-        day = date.fromisoformat(p.parent.name)
-        available = pd.Timestamp(p.stat().st_mtime, unit="s", tz="UTC")
-        if not local(day - DAY, "16:00") <= available < local(day, "04:00"):
-            continue
-        view = j.get("market_view") or {}
-        sector = view.get("semis") or {}
-        bias = sector.get("bias") or {"risk_off": "short", "risk_on": "long"}.get(view.get("regime"), "both")
-        confidence = float(sector.get("confidence", view.get("confidence", 0)) or 0)
-        directions = {"short": {"SOXS"}, "long": {"SOXL"}, "none": set()}.get(bias, set(TICKERS))
-        views.setdefault(day, []).append((available, directions if confidence >= .7 else set(TICKERS)))
-    for items in views.values():
-        items.sort(key=lambda item: item[0])
-    return views
-
-
 @dataclass(slots=True)
 class Position:
     symbol: str
@@ -389,7 +366,7 @@ class Replay:
             if self.order:
                 self.fill(exit_t, self.order.limit)
 
-    def replay_day(self, day, preparation, votes, step, records, prev, korea, views):
+    def replay_day(self, day, preparation, votes, step, records, prev, korea):
         length = pd.Timedelta(minutes=step)
         start, stop_scan = local(day - DAY, "21:00"), local(day, "04:00")
         regular, reentry = local(day, "09:30"), local(day, "15:00")
@@ -474,22 +451,16 @@ class Replay:
                         and last_overnight is not None):
                     price = last_overnight
                     south, source = korea.lookup(t)
-                    view = set(TICKERS)
-                    for available, directions in views:
-                        if available <= t:
-                            view = directions
                     if south is not None:
                         direction = None
                         if price >= prev * 1.03 and south >= .01 and price > path_high * .94:
                             direction = "SOXL"
                         elif price <= prev * .97 and south <= -.01 and price < path_low * 1.06:
                             direction = "SOXS"
-                        if direction in (view & allowed_target) and direction in previous:
+                        if direction in allowed_target and direction in previous:
                             self.submit(direction, "BUY", "tactical", "tactical_entry", previous[direction], t)
                             if self.order:
                                 self.stats[f"signal_{source}"] += 1
-                            if not views or views[0][0] > t:
-                                self.stats["signal_without_archived_view"] += 1
             if self.order:
                 is_flatten = self.order.reason == "flatten"
                 self.try_fill(t, new.get(self.order.symbol))
@@ -552,7 +523,7 @@ def main(source, output):
     raw = {sym: native_daily(data[sym], splits[sym]) for sym in TICKERS}
     days = sorted(set.intersection(*(set(df.index) for df in data.values())))
     minute = Intraday(source, [d for d in days if d >= OVERNIGHT_LAUNCH], raw, splits)
-    korea, views = Korea(source), load_views(source)
+    korea = Korea(source)
     tradable = [d for d, resolution in minute.step.items() if resolution and d <= END]
     windows = {
         "2020_2026": date(2020, 1, 1),
@@ -586,7 +557,7 @@ def main(source, output):
                 if step:
                     preparation = minute.afterhours(yesterday, step)
                     k = korea if variant == "hybrid" else NoKorea()
-                    run.replay_day(d, preparation, vote, step, records, prev, k, views.get(d, []))
+                    run.replay_day(d, preparation, vote, step, records, prev, k)
                 else:
                     run.stats["pre_ovn_launch" if d < OVERNIGHT_LAUNCH else "missing_full_session"] += 1
                     run.approximate(d, vote, bars["SOXL"], bars)
@@ -611,8 +582,8 @@ def main(source, output):
     coverage_days = [d for d in days if d >= date(2020, 1, 1)]
     eligible = pd.DataFrame({"date": coverage_days, "minutes": [minute.step.get(d, 0) for d in coverage_days]})
     eligible.to_csv(output / "minute_coverage.csv", index=False)
-    report["data"] = {"night_first": str(min(tradable)), "m1_first": str(first_m1),
-                      "night_last": str(max(tradable)), "views": {str(k): len(v) for k, v in views.items()},
+    report["data"] = {"market_review": False, "night_first": str(min(tradable)), "m1_first": str(first_m1),
+                      "night_last": str(max(tradable)),
                       "rescaled": dict(minute.rescaled),
                       "mean_abs_rth_close_error": {m: sum(items) / len(items) if items else None
                                                    for m, items in minute.close_diff.items()}}

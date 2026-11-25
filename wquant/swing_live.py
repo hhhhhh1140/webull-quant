@@ -40,10 +40,10 @@ DEFAULTS = {
                  "stop_pct": 0.06, "reentry": True, "rebound_pct": 0.03, "last_reentry": "15:00",
                  "max_reentries": None,                                  # 一天买回次数不限
                  "reentry_stop_pct": None,                               # 买回后第 2 腿兜底止损（None = 沿用 stop_pct/trail_pct）
-                 # 三票制双层动态切换：上涨趋势拿核心 SOXL 过夜（单日跌 12% 止损、次日起盘中反弹 5% 买回）；
+                 # 三票制双层动态切换：上涨趋势拿核心 SOXL 过夜（按入场均价设 12% 止损、次日起按当天低点反弹 5% 买回）；
                  # 非上涨趋势清空核心、切入战术层（下跌趋势只做空 SOXS，震荡期双向）
                  "trend_switch": {"enabled": False, "index": "SOXX", "core_symbol": "SOXL",
-                                  "core_frac": 1.0, "day_stop_pct": 0.12, "rebuy_pct": 0.05,
+                                  "core_frac": 1.0, "stop_pct": 0.12, "rebuy_pct": 0.05,
                                   "core_session_start": "09:30"},
                  # 融资与盈利加仓：夜盘不能融资（最多 100%），盘前 / 常规时段最多 130%
                  "max_frac_ovn": 1.0, "max_frac": 1.3,
@@ -51,7 +51,6 @@ DEFAULTS = {
                  "trail_after_add": 0.06,
                  "trail_pct": None,                                      # 移动止损：从持仓最高价回撤这个比例就卖（之后反弹 rebound_pct 买回）
                  "poll_seconds": 60, "sides": ["long", "short"],
-                 "view_gate": True, "view_min_confidence": 0.7,
                  # 分时路径：不只看"现在相对昨收"，还看昨收以来（盘后 + 夜盘 + 盘前）的高低点和 VWAP
                  "path": {"enabled": False,
                           "vwap_filter": True,      # 做多要在 VWAP 上方，做空要在 VWAP 下方
@@ -80,7 +79,12 @@ def _deep_merge(base: dict, over: dict) -> dict:
 
 def swing_cfg(settings: Settings) -> dict:
     """默认值 + config.yaml 的 swing 部分（逐层合并，只写部分字段也不会丢掉其他默认值）。"""
-    return _deep_merge(json.loads(json.dumps(DEFAULTS)), settings.section("swing"))
+    overrides = settings.section("swing")
+    cfg = _deep_merge(json.loads(json.dumps(DEFAULTS)), overrides)
+    old = (overrides.get("tactical") or {}).get("trend_switch") or {}
+    if "day_stop_pct" in old and "stop_pct" not in old:
+        cfg["tactical"]["trend_switch"]["stop_pct"] = old["day_stop_pct"]
+    return cfg
 
 
 # ---------------------------------------------------------------- 账本
@@ -108,6 +112,7 @@ class Books:
 class Market(Protocol):
     def last_price(self, sym: str) -> tuple[datetime, float]: ...
     def prev_rth_close(self, sym: str, day: date) -> float: ...
+    def rth_low(self, sym: str, day: date, now: datetime) -> float | None: ...
     def daily(self, sym: str, count: int) -> pd.DataFrame: ...
     def kospi_move(self, now: datetime) -> float | None: ...
     def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]: ...
@@ -151,6 +156,14 @@ class WebullMarket:
     def last_price(self, sym: str) -> tuple[datetime, float]:
         b = self._bars(sym, "M1", 3)
         return b.index[-1].to_pydatetime(), float(b.close.iloc[-1])
+
+    def rth_low(self, sym: str, day: date, now: datetime) -> float | None:
+        bars = self._bars(sym, "M1", 400)
+        if bars.empty:
+            return None
+        completed = (bars.index + pd.Timedelta(minutes=1) <= now) & (bars.index.date == day)
+        regular = bars.loc[completed & (bars.session == "RTH"), "low"]
+        return float(regular.min()) if not regular.empty else None
 
     def prev_rth_close(self, sym: str, day: date) -> float:
         b = self._bars(sym, "M5", 600)
@@ -278,7 +291,7 @@ class TacState:
     symbol: str = ""
     move: float | None = None
     korea_move: float | None = None
-    gate: str = ""                                  # 市场研判给的方向限制
+    gate: str = ""                                  # 三票制方向限制
     frac: float = 0.0                               # 当天的仓位比例（止损后买回沿用）
     sizing_note: str = ""
     qty: int = 0
@@ -299,17 +312,17 @@ class TacState:
     trend_regime: int | None = None                 # +1 上涨 / 0 震荡 / -1 下跌
     trend_note: str = ""
     core_active_today: bool = False                 # 今天是否由核心层接管
+    core_day_low: float | None = None
     log: list = field(default_factory=list)
 
 
 @dataclass
 class CoreState:
-    """跨日持久化的核心层状态（用于三票制双层切换 + 单日 12% 止损 + 次日起反弹 5% 买回）。"""
+    """跨日持久化的核心层状态（用于三票制双层切换及成本止损）。"""
     holding: bool = False
     entry: float = 0.0
     stopped: bool = False
     stopped_day: str = ""
-    low_since_stop: float | None = None
     last_votes: int | None = None
     last_regime: int | None = None
     last_index_date: str = ""
@@ -386,34 +399,18 @@ def _add_pnl(settings: Settings, pnl: float, day: str) -> None:
     p.write_text(json.dumps(d, indent=1))
 
 
-# ---- 市场研判给的方向限制
-def view_gate(settings: Settings, day: date) -> tuple[set, str]:
-    """读当天的 decisions.json。优先用 market_view.semis（bias: long/short/both/none）；
-    没有就用 regime 映射：高置信度 risk_off → 只做空，risk_on → 只做多。"""
-    t = swing_cfg(settings)["tactical"]
-    sides = set(t["sides"])
-    if not t.get("view_gate", True):
-        return sides, "研判开关关闭"
-    from .engine import DECISIONS
-    p = DECISIONS / str(day) / "decisions.json"
-    if not p.exists():
-        return sides, "今天没有市场研判，两边都可以做"
-    mv = (json.loads(p.read_text(encoding="utf-8")).get("market_view") or {})
-    semis = mv.get("semis") or {}
-    conf = float(semis.get("confidence", mv.get("confidence", 0)) or 0)
-    bias = semis.get("bias")
-    if bias is None:
-        bias = {"risk_off": "short", "risk_on": "long"}.get(mv.get("regime"), "both")
-    if bias in ("long", "short", "none") and conf < t["view_min_confidence"]:
-        lab = {"long": "偏多", "short": "偏空", "none": "建议观望"}[bias]
-        return sides, f"研判{lab}但置信度 {conf:.2f} 不够，两边都可以做"
-    if bias == "none":
-        return set(), f"研判建议今天观望（置信度 {conf:.2f}）"
-    if bias == "long":
-        return sides & {"long"}, f"研判偏多（置信度 {conf:.2f}），只做 SOXL"
-    if bias == "short":
-        return sides & {"short"}, f"研判偏空（置信度 {conf:.2f}），只做 SOXS"
-    return sides, "研判中性，两边都可以做"
+def tactical_directions(config: dict, regime: int | None) -> tuple[set[str], str]:
+    sides = set(config["sides"])
+    if regime == 1:
+        sides &= {"long"}
+    elif regime == -1:
+        sides &= {"short"}
+    description = {
+        frozenset({"long", "short"}): "规则允许双向",
+        frozenset({"long"}): "规则只允许买 SOXL",
+        frozenset({"short"}): "规则只允许买 SOXS",
+    }
+    return sides, description.get(frozenset(sides), "规则禁开仓")
 
 
 def efficiency_ratio(close: pd.Series, n: int) -> float | None:
@@ -544,10 +541,15 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         tt = now.astimezone(ET).time()
         return tt >= time(20, 0) or tt < time(4, 0)
 
+    def affordable_shares(budget, px):
+        offset = getattr(broker, "order_cfg", {}).get("limit_offset_bps", 0) / 1e4
+        limit = round(px * (1 + offset), 2)
+        return math.floor(budget / limit) if limit > 0 else 0
+
     def enter(sym, px, why):
         eq = system_equity(settings)
         f = min(st.frac or t["position_frac"], t["max_frac_ovn"] if in_ovn() else t["max_frac"])
-        qty = math.floor(eq * f / px)
+        qty = affordable_shares(eq * f, px)
         if qty < 1:
             note(f"本金 ${eq:,.0f} 太少，买不起 1 股 {sym}")
             return
@@ -587,7 +589,7 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
     def core_buy(cst: CoreState, core_sym: str, px: float, why: str) -> bool:
         eq = system_equity(settings)
         f = float(ts_cfg.get("core_frac", 1.0))
-        qty = math.floor(eq * f / px)
+        qty = affordable_shares(eq * f, px)
         if qty < 1:
             note(f"[核心层] 本金 ${eq:,.0f} 太少，买不起 1 股 {core_sym}")
             return False
@@ -595,7 +597,7 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             if not dry:
                 books.add("core", core_sym, qty)
             cst.holding, cst.entry = True, px
-            cst.stopped, cst.stopped_day, cst.low_since_stop = False, "", None
+            cst.stopped, cst.stopped_day = False, ""
             _save_core_state(settings.environment, cst)
             note(f"[核心层] 买入 {core_sym} {qty} 股 @ {px:.2f}，约 ${qty * px:,.0f}（{qty * px / eq:.0%}，{why}）")
             return True
@@ -611,9 +613,9 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             _add_pnl(settings, pnl, st.day)
             cst.holding, cst.entry = False, 0.0
             if mark_stopped:
-                cst.stopped, cst.stopped_day, cst.low_since_stop = True, str(day), px
+                cst.stopped, cst.stopped_day = True, str(day)
             else:
-                cst.stopped, cst.stopped_day, cst.low_since_stop = False, "", None
+                cst.stopped, cst.stopped_day = False, ""
             _save_core_state(settings.environment, cst)
             note(f"[核心层] 卖出 {core_sym} {qty} 股 @ {px:.2f}（{why}），本笔 {(px / basis - 1):+.1%} / ${pnl:+,.0f}")
             return True
@@ -638,13 +640,14 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         if st.trend_regime != 1:
             if core_qty > 0:
                 _, cpx = md.last_price(core_sym)
-                core_sell(cst, core_sym, core_qty, cpx, f"趋势转弱（三票 {st.trend_votes:+d}），平掉核心仓", mark_stopped=False)
+                if not core_sell(cst, core_sym, core_qty, cpx, f"趋势转弱（三票 {st.trend_votes:+d}），平掉核心仓", mark_stopped=False):
+                    return st
             elif cst.stopped:
-                cst.stopped, cst.stopped_day, cst.low_since_stop = False, "", None
+                cst.stopped, cst.stopped_day = False, ""
                 _save_core_state(settings.environment, cst)
         else:
             # 上涨趋势：
-            # A) 已持有核心仓，或未处于止损冷却 → 今天由核心层全权接管（盘中 09:30 起建仓 & 盯单日 12% 止损，收盘保留过夜）
+            # A) 已持有核心仓，或未处于止损冷却 → 今天由核心层全权接管（盘中 09:30 起建仓并按成本止损，收盘保留过夜）
             if core_qty > 0 or not cst.stopped:
                 st.core_active_today = True
                 st.decided = True
@@ -652,9 +655,9 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
                     note(f"[核心层] 收盘保留 {core_sym} {core_qty} 股过夜，系统权益 ${system_equity(settings):,.0f}")
                     st.done = True
                     return st
-                if now < core_start:
-                    return st
                 if core_qty == 0:
+                    if now < core_start:
+                        return st
                     if KILL_SWITCH.exists():
                         note("KILL_SWITCH 存在，核心层今天不开仓")
                         st.done = True
@@ -662,14 +665,13 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
                     _, cpx = md.last_price(core_sym)
                     core_buy(cst, core_sym, cpx, f"三票上涨趋势（{st.trend_votes:+d} 票）建核心仓")
                     return st
-                # 持仓中：监控单日相对昨收急跌 >= day_stop_pct
-                prev_c = md.prev_rth_close(core_sym, day)
+                if cst.entry <= 0:
+                    raise RuntimeError("核心持仓缺少入场均价，请核对本地账本与券商成交")
                 _, cpx = md.last_price(core_sym)
-                stop_p = float(ts_cfg.get("day_stop_pct", 0.12))
-                if cpx <= prev_c * (1 - stop_p):
-                    core_sell(cst, core_sym, core_qty, cpx,
-                              f"核心单日急跌止损（较昨收 {prev_c:.2f} 跌 {cpx / prev_c - 1:+.1%}）", mark_stopped=True)
-                    st.done = True  # 止损当天不再买回，次日起盯反弹 5% 买回
+                stop_p = float(ts_cfg["stop_pct"])
+                if cpx <= cst.entry * (1 - stop_p):
+                    st.done = core_sell(cst, core_sym, core_qty, cpx,
+                                        f"核心成本止损（均价 {cst.entry:.2f}，现价 {cpx:.2f}）", mark_stopped=True)
                 return st
 
             # B) 上涨趋势但核心层已止损空仓（cst.stopped == True）：
@@ -684,19 +686,19 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
                     st.done = True
                     return st
                 _, cpx = md.last_price(core_sym)
-                cst.low_since_stop = min(cst.low_since_stop or cpx, cpx)
+                low = md.rth_low(core_sym, day, now)
+                if low is None:
+                    return st
+                st.core_day_low = min(st.core_day_low or low, low, cpx)
                 reb = float(ts_cfg.get("rebuy_pct", 0.05))
-                if cpx >= cst.low_since_stop * (1 + reb):
+                if cpx >= st.core_day_low * (1 + reb):
                     if KILL_SWITCH.exists():
                         note("KILL_SWITCH 存在，核心层不买回")
                         st.done = True
                         return st
-                    low_ref = cst.low_since_stop
-                    if core_buy(cst, core_sym, cpx, f"核心止损后次日起从低点 {low_ref:.2f} 反弹 {reb:.0%} 买回"):
+                    if core_buy(cst, core_sym, cpx, f"从当日常规盘低点 {st.core_day_low:.2f} 反弹 {reb:.0%} 买回"):
                         st.core_active_today = True
                         st.decided = True
-                else:
-                    _save_core_state(settings.environment, cst)
                 return st
 
     # 1) 还没进场：在各个检查时点判断
@@ -718,17 +720,10 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             note("已过入场时间窗口，今天不做")
             st.decided = st.done = True
             return st
-        if not st.gate:
-            allowed, st.gate = view_gate(settings, day)
-            note(st.gate)
-        else:
-            allowed, _ = view_gate(settings, day)
-        # 三票制方向门禁：上涨趋势禁空，下跌趋势禁多
-        if dual:
-            if st.trend_regime == 1:
-                allowed = allowed & {"long"}
-            elif st.trend_regime == -1:
-                allowed = allowed & {"short"}
+        allowed, direction_note = tactical_directions(t, st.trend_regime if dual else None)
+        if st.gate != direction_note:
+            st.gate = direction_note
+            note(direction_note)
         prev = md.prev_rth_close(t["long"], day)
         _, px = md.last_price(t["long"])
         st.move = px / prev - 1
@@ -748,7 +743,7 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
                 side = 0
                 why += " → 韩国不确认"
         if side and ("long" if side > 0 else "short") not in allowed:
-            why += " → 方向被趋势/市场研判限制"
+            why += " → 方向被三票制或配置限制"
             side = 0
         last_cp = all(c in st.evaluated for c in t["checkpoints"]) and (not _continuous(t) or now >= hi_t)
         if not side:
@@ -841,7 +836,7 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
         return st
     if ts_cfg.get("enabled"):
         print(f"[双层模式] 启用三票制动态切换（{ts_cfg.get('index', 'SOXX')}）："
-              f"上涨持 {ts_cfg.get('core_symbol', 'SOXL')}（单日止损 {ts_cfg.get('day_stop_pct', 0.12):.0%} / 次日起反弹 {ts_cfg.get('rebuy_pct', 0.05):.0%} 买回），"
+              f"上涨持 {ts_cfg.get('core_symbol', 'SOXL')}（成本止损 {ts_cfg['stop_pct']:.0%} / 次日起由当日低点反弹 {ts_cfg.get('rebuy_pct', 0.05):.0%} 买回），"
               f"非上涨切战术层")
     if _continuous(t):
         lo_t, hi_t = _scan_window(t, day)
@@ -859,7 +854,9 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
         if st.done:
             break
         core_start = _at(day, ts_cfg.get("core_session_start", "09:30"))
-        if ts_cfg.get("enabled") and st.trend_regime == 1 and st.decided and st.qty == 0 and st.trades == 0 and now < core_start:
+        if (ts_cfg.get("enabled") and st.trend_regime == 1 and st.decided and st.qty == 0
+                and st.trades == 0 and now < core_start
+                and not books.qty("core", ts_cfg.get("core_symbol", t["long"]))):
             sleep_fn(max(1.0, (core_start - now_fn()).total_seconds()))
         elif not st.decided:
             pending = [_at(day, c) for c in t["checkpoints"] if c not in st.evaluated]

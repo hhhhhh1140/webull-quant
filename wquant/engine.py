@@ -1,12 +1,4 @@
-"""每日流程，拆成两个阶段：
-
-  scan     数据 → 规则信号 → 生成候选包 decisions/<日期>/candidates.json
-  (审核)   Claude Code 读候选包，写 decisions/<日期>/decisions.json
-           （或 ai.mode=api 时由程序调用 Claude API；ai.mode=off 时全部按规则执行）
-  execute  读决策 → 风控 → 下单 → 日志
-
-拆开之后，审核这一步可以由 Claude Code 在订阅额度内完成，程序本身不调用任何付费 API。
-"""
+"""Candidate generation and execution for the separate individual-stock rules."""
 from __future__ import annotations
 
 import json
@@ -41,7 +33,7 @@ class Account:
 
 class DecisionFile(BaseModel):
     date: str
-    reviewer: str = "claude-code"
+    reviewer: str = "archive"
     market_view: dict | None = None
     hedges: list[dict] = []
     decisions: list[dict] = []
@@ -114,7 +106,7 @@ def _update_ledger(env: str, side: str, symbol: str, qty: int) -> None:
 # =====================================================================
 def scan(settings: Settings, source: str = "webull", force: bool = False) -> Path | None:
     strat, ai_cfg, risk_cfg = settings.section("strategy"), settings.section("ai"), settings.section("risk")
-    if (day_dir() / "decisions.json").exists() and not force:
+    if ai_cfg.get("mode", "off") != "off" and (day_dir() / "decisions.json").exists() and not force:
         print("今天的候选已经审核过了（decisions.json 已存在），不再覆盖。确实要重新扫描请加 --force")
         return None
     if RiskManager.kill_switch_on():
@@ -258,17 +250,17 @@ def scan(settings: Settings, source: str = "webull", force: bool = False) -> Pat
 
 
 # =====================================================================
-# 审核：三种来源
+# 旧版决策文件兼容
 # =====================================================================
 def load_decisions(day: str | None = None) -> dict[str, Decision]:
     return load_review(day)[0]
 
 
 def load_review(day: str | None = None) -> tuple[dict[str, Decision], MarketView | None, list[HedgeProposal]]:
-    """读取 Claude Code 写的 decisions.json，逐条校验。返回 (个股结论, 市场研判, 对冲提议)。"""
+    """读取存档 decisions.json，逐条校验。返回 (个股结论, 市场研判, 对冲提议)。"""
     path = day_dir(day) / "decisions.json"
     if not path.exists():
-        raise FileNotFoundError(f"{path.relative_to(ROOT)} 不存在。请先让 Claude Code 审核（/trade-review）")
+        raise FileNotFoundError(f"{path.relative_to(ROOT)} 不存在。请选择规则执行或提供对应日期的存档文件")
     f = DecisionFile.model_validate_json(path.read_text(encoding="utf-8"))
     if f.date != (day or str(date.today())):
         raise ValueError(f"decisions.json 的日期 {f.date} 与今天不符，拒绝执行过期决策")
@@ -294,17 +286,13 @@ def load_review(day: str | None = None) -> tuple[dict[str, Decision], MarketView
     return out, view, hedges
 
 
-def decide_with_api(settings: Settings, candidates: list[dict]) -> dict[str, Decision]:
-    from .analyst import ApiAnalyst  # 只有 api 模式才会导入 anthropic
-    a = ApiAnalyst(settings.section("ai"))
-    return {c["symbol"]: a.review(c) for c in candidates}
-
-
 # =====================================================================
 # 阶段 2：execute
 # =====================================================================
-def execute(settings: Settings, review: str, confirm_live: bool = False, source: str = "webull") -> list[dict]:
-    """review: file（读 Claude Code 写的决策）| api | off"""
+def execute(settings: Settings, review: str = "off", confirm_live: bool = False, source: str = "webull") -> list[dict]:
+    """默认按规则执行，file 仅用于兼容已有决策文件。"""
+    if review not in {"off", "file"}:
+        raise ValueError(f"不支持的决策来源: {review}")
     ai_cfg, risk_cfg, order_cfg = settings.section("ai"), settings.section("risk"), settings.section("order")
     rm = RiskManager(risk_cfg, settings.universe)
     if rm.kill_switch_on():
@@ -325,11 +313,9 @@ def execute(settings: Settings, review: str, confirm_live: bool = False, source:
     view, hedges = None, []
     if review == "file":
         decisions, view, hedges = load_review()
-    elif review == "api":
-        decisions = decide_with_api(settings, candidates)
     else:
         decisions = {c["symbol"]: Decision(action="APPROVE", confidence=1.0, conviction=1.0,
-                                           reasoning="AI 关闭，按规则执行", key_risks=[]) for c in candidates}
+                                           reasoning="按规则执行", key_risks=[]) for c in candidates}
     if view:
         print(f"市场研判: {view.regime}  置信度 {view.confidence:.2f} — {view.summary}")
         journal.record("market_view", **view.model_dump())

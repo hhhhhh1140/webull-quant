@@ -1,12 +1,13 @@
 """本地网页仪表盘：python -m wquant dashboard
 
-只监听 127.0.0.1，只读：查询账户、订单、日志和决策文件，不会下单，也不改任何配置。
+只监听 127.0.0.1，只读：查询账户、订单和策略状态，不会下单，也不改任何配置。
 """
 from __future__ import annotations
 
 import json
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -67,41 +68,6 @@ def realized_pnl(fills: list[dict]) -> tuple[float, list[dict]]:
 
 
 # ---------------------------------------------------------------- 各部分数据
-def _decisions_history(limit_days: int = 30) -> list[dict]:
-    from .engine import DECISIONS
-    outcomes: dict[tuple[str, str], dict] = {}
-    for f in sorted(journal.LOGS.glob("*.jsonl")):
-        for line in f.read_text(encoding="utf-8").splitlines():
-            r = json.loads(line)
-            if r.get("event") in ("decision", "order") and r.get("symbol"):
-                outcomes[(f.stem, r["symbol"])] = {"outcome": r.get("outcome"), "order": r.get("order"),
-                                                   "risk_notes": r.get("risk_notes")}
-    days = []
-    for c in sorted(DECISIONS.glob("*/candidates.json"))[-limit_days:]:
-        day = c.parent.name
-        packet = json.loads(c.read_text(encoding="utf-8"))
-        dpath = c.parent / "decisions.json"
-        decs = {}
-        reviewer, view, hedges = None, None, []
-        if dpath.exists():
-            d = json.loads(dpath.read_text(encoding="utf-8"))
-            reviewer = d.get("reviewer")
-            view = d.get("market_view")
-            hedges = [{**h, **outcomes.get((day, str(h.get("symbol", "")).upper()), {})} for h in d.get("hedges", [])]
-            decs = {x.get("symbol", "").upper(): x for x in d.get("decisions", [])}
-        items = []
-        for cand in packet["candidates"]:
-            s = cand["symbol"]
-            items.append({
-                "symbol": s, "action": cand["action"], "price": cand["price"], "rule_reason": cand["rule_reason"],
-                "review": decs.get(s), **outcomes.get((day, s), {}),
-            })
-        days.append({"date": day, "environment": packet.get("environment"), "reviewer": reviewer, "items": items,
-                     "market_view": view, "hedges": hedges, "sentiment": packet.get("sentiment"),
-                     "blocked_buys": packet.get("blocked_buys", [])})
-    return list(reversed(days))
-
-
 _bt_cache: dict = {}
 
 
@@ -266,20 +232,13 @@ def _swing(settings: Settings) -> dict:
     day = SL.trading_day(_dt.now(SL.ET))
     states = sorted(journal.STATE.glob(f"swing_tactical_{env}_*.json"))[-10:]
     tactical = [json.loads(x.read_text()) for x in reversed(states)]
-    core = None
-    for f in sorted(journal.LOGS.glob("*.jsonl"), reverse=True):
-        for line in reversed(f.read_text(encoding="utf-8").splitlines()):
-            r = json.loads(line)
-            if r.get("event") == "swing_core":
-                core = r
-                break
-        if core:
-            break
+    cfg = SL.swing_cfg(settings)
+    core = SL._load_core_state(env)
     eqp = SL._equity_path(env)
     eq = json.loads(eqp.read_text()) if eqp.exists() else {"capital": SL.swing_cfg(settings)["tactical"]["capital"],
                                                             "equity": SL.system_equity(settings), "history": []}
-    allowed, gate = SL.view_gate(settings, day)
-    return {"books": books, "next_day": str(day), "tactical": tactical, "core": core, "config": SL.swing_cfg(settings),
+    allowed, gate = SL.tactical_directions(cfg["tactical"], core.last_regime)
+    return {"books": books, "next_day": str(day), "tactical": tactical, "core": asdict(core), "config": cfg,
             "equity": eq, "gate": gate, "allowed": sorted(allowed)}
 
 
@@ -345,11 +304,10 @@ def collect(settings: Settings) -> dict:
             "events": _events(settings),
             "swing": _swing(settings),
             "market": _market(settings),
-            "region": settings.region_id, "mode": settings.mode, "ai_mode": settings.section("ai").get("mode"),
+            "region": settings.region_id, "mode": settings.mode,
             "live_trading_enabled": settings.live_trading_enabled, "universe": settings.universe,
             "risk": settings.section("risk"), "kill_switch": (ROOT / "KILL_SWITCH").exists()}
-    for key, fn in (("account", lambda: _account(settings)), ("decisions", _decisions_history),
-                    ("backtest", lambda: _backtest(settings))):
+    for key, fn in (("account", lambda: _account(settings)), ("backtest", lambda: _backtest(settings))):
         try:
             data[key] = fn()
         except Exception as e:   # 某一块失败不影响其他部分显示

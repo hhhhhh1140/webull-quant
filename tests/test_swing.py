@@ -20,6 +20,9 @@ class FakeMarket:
     def last_price(self, sym):
         return datetime.now(ET), self.prices[sym]
 
+    def rth_low(self, sym, day, now):
+        return self.prices[sym]
+
     def prev_rth_close(self, sym, day):
         return self.prev[sym]
 
@@ -119,31 +122,29 @@ def test_no_signal_any_checkpoint_means_no_trade(env):
     assert st.done and not br.orders
 
 
-def test_view_gate_blocks_and_allows(env):
+def test_old_review_file_cannot_block_tactical_entry(env):
     s, books, tmp = env
-    write_view(tmp, {"regime": "risk_off", "confidence": 0.8, "summary": "x"})
-    md = FakeMarket({"SOXL": 104.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=0.02)   # 做多信号
-    br = FakeBroker()
-    st = SL.tactical_step(s, md, br, books, SL.TacState(day=str(DAY)), at("21:00"))
-    assert not br.orders and "只做 SOXS" in st.gate
-    md2 = FakeMarket({"SOXL": 95.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=-0.02)  # 做空信号
-    st2 = SL.tactical_step(s, md2, br, books, SL.TacState(day=str(DAY + timedelta(days=1))), at("21:00", DAY + timedelta(days=1)))
-    assert not br.orders or br.orders[-1][0] == "SOXS"
+    s.raw["swing"]["tactical"]["view_gate"] = True
+    write_view(tmp, {"regime": "risk_off", "confidence": 0.9, "semis": {"bias": "none", "confidence": 0.9}})
+    md = FakeMarket({"SOXL": 104.0}, {"SOXL": 100.0}, kospi=0.02)
+    broker = FakeBroker()
+
+    state = SL.tactical_step(s, md, broker, books, SL.TacState(day=str(DAY)), at("21:00"))
+
+    assert state.qty > 0
+    assert broker.orders[0][:2] == ("SOXL", "BUY")
 
 
-def test_view_gate_semis_override_and_low_confidence(env):
-    s, books, tmp = env
-    write_view(tmp, {"regime": "risk_off", "confidence": 0.9, "summary": "x",
-                     "semis": {"bias": "none", "confidence": 0.8, "reason": "CPI 前观望"}})
-    allowed, why = SL.view_gate(s, DAY)
-    assert allowed == set() and "观望" in why
-    write_view(tmp, {"regime": "risk_off", "confidence": 0.6, "summary": "x",
-                     "semis": {"bias": "none", "confidence": 0.55, "reason": "方向不明"}})
-    allowed, why = SL.view_gate(s, DAY)          # 低置信度的观望不拦
-    assert allowed == {"long", "short"} and "不够" in why
-    write_view(tmp, {"regime": "risk_off", "confidence": 0.5, "summary": "x"})
-    allowed, _ = SL.view_gate(s, DAY)
-    assert allowed == {"long", "short"}
+def test_run_defaults_to_the_dual_layer_entry_point(monkeypatch):
+    from wquant import cli
+
+    settings = _dual_settings()
+    monkeypatch.setattr(cli, "load_settings", lambda _: settings)
+    calls = []
+    monkeypatch.setattr(cli, "cmd_swing", lambda args, s: calls.append((args.what, args.mode, s)) or 0)
+
+    assert cli.main(["run"]) == 0
+    assert calls == [("tactical", "dry_run", settings)]
 
 
 def test_korea_opposite_blocks_short(env):
@@ -422,9 +423,13 @@ def test_dual_uptrend_core_stop_and_next_day_rebuy(env):
     st1 = SL.tactical_step(s, md, br, books, st1, at("15:55"))
     assert st1.done and books.qty("core", "SOXL") == 30
 
-    # 第 2 天：相对昨收 100 急跌 -12.5% → 盘中触发单日 12% 止损，当日结束不再买回
+    # The previous close would stop the position at 90, but its entry basis is 100.
     day2 = DAY + timedelta(days=1)
     st2 = SL.TacState(day=str(day2))
+    md.prev["SOXL"] = 140.0
+    md.prices["SOXL"] = 90.0
+    st2 = SL.tactical_step(s, md, br, books, st2, at("09:45", day2))
+    assert books.qty("core", "SOXL") == 30
     md.prices["SOXL"] = 87.5
     st2 = SL.tactical_step(s, md, br, books, st2, at("10:00", day2))
     assert st2.done and books.qty("core", "SOXL") == 0
@@ -441,6 +446,26 @@ def test_dual_uptrend_core_stop_and_next_day_rebuy(env):
     st3 = SL.tactical_step(s, md, br, books, st3, at("10:30", day3))
     assert books.qty("core", "SOXL") > 0 and br.orders[-1][:2] == ("SOXL", "BUY")
     assert not SL._load_core_state("uat").stopped
+
+
+def test_core_buyback_resets_the_low_each_trading_day(env):
+    _, books, _ = env
+    s = _dual_settings()
+    market = FakeMarket({"SOXL": 80.0}, {})
+    market.daily_df = _trend_df(up=True)
+    broker = FakeBroker()
+    SL._save_core_state("uat", SL.CoreState(stopped=True, stopped_day=str(DAY)))
+    first_day = DAY + timedelta(days=1)
+    second_day = DAY + timedelta(days=2)
+
+    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(first_day)), at("09:30", first_day))
+    assert state.core_day_low == 80.0
+    market.prices["SOXL"] = 90.0
+    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(second_day)), at("09:30", second_day))
+    assert state.core_day_low == 90.0 and not broker.orders
+    market.prices["SOXL"] = 94.6
+    SL.tactical_step(s, market, broker, books, state, at("10:00", second_day))
+    assert broker.orders[0][:2] == ("SOXL", "BUY")
 
 
 def test_dual_downtrend_liquidates_core_blocks_long_and_uses_leg2_stop(env):

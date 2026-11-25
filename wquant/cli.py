@@ -75,7 +75,7 @@ def cmd_execute(args, s):
     from datetime import datetime
     from .engine import day_dir, execute
     _apply_mode(args, s)
-    review = args.review or {"claude_code": "file", "api": "api", "off": "off"}[s.section("ai").get("mode", "claude_code")]
+    review = args.review or "off"
     # 真实下单每天只执行一次（定时任务和手动运行撞在一起时防止重复下单）
     marker = day_dir() / f"executed_{s.mode}_{s.environment}.json"
     if s.mode == "webull" and marker.exists() and not args.force:
@@ -91,17 +91,9 @@ def cmd_execute(args, s):
 
 
 def cmd_run(args, s):
-    """scan + execute。ai.mode=claude_code 时只做 scan，等 Claude Code 审核后再 execute。"""
-    from .engine import execute, scan
-    _apply_mode(args, s)
-    ai_mode = "off" if args.no_ai else s.section("ai").get("mode", "claude_code")
-    if not scan(s, source=args.source):
-        return 1
-    if ai_mode == "claude_code":
-        print("\n下一步：在 Claude Code 里运行 /trade-review 审核候选，然后执行 `python -m wquant execute`")
-        return 0
-    execute(s, review="api" if ai_mode == "api" else "off", confirm_live=args.confirm_live, source=args.source)
-    return 0
+    """Run the semiconductor core and tactical layers using the same entry point as swing tactical."""
+    args.what = "tactical"
+    return cmd_swing(args, s)
 
 
 def _my_order_ids() -> set[str]:
@@ -388,7 +380,7 @@ def cmd_swing(args, s):
         if (cfg["tactical"].get("trend_switch") or {}).get("enabled"):
             cst = SL._load_core_state(s.environment)
             print(f"双层状态: 持核心={cst.holding} 均价={cst.entry:.2f} 止损冷却={cst.stopped}"
-                  f"({cst.stopped_day or '-'}, 低点={cst.low_since_stop}) 最近三票={cst.last_votes}")
+                  f"({cst.stopped_day or '-'}) 最近三票={cst.last_votes}")
         day = SL.trading_day(now())
         st = SL._load_state(s.environment, day)
         print(f"战术层 {day}: " + ("\n  ".join(st.log) if st.log else "还没开始"))
@@ -419,29 +411,24 @@ def cmd_swing(args, s):
             _time.sleep(10)
     md = SL.WebullMarket(client, now)
     broker = SL.make_broker(s, mode, args.confirm_live, cfg["order"])
-    dry = mode != "webull"
+    if mode == "dry_run":
+        from dataclasses import replace
+        s = replace(s, environment=f"{s.environment}_dry")
+        books = SL.Books(s.environment)
     if args.what == "core":
         if not cfg["core"].get("enabled", True):
             print("核心层在 config.yaml 里是关闭的（swing.core.enabled: false）")
             return 0
-        SL.core_rebalance(s, md, broker, books, dry=dry)
+        SL.core_rebalance(s, md, broker, books)
     elif args.what == "tactical":
-        SL.run_tactical_day(s, md, broker, books, now, dry=dry)
+        SL.run_tactical_day(s, md, broker, books, now)
     return 0
 
 
 def cmd_status(args, s):
-    from .engine import day_dir
-    d = day_dir()
-    c, dec = d / "candidates.json", d / "decisions.json"
-    print(f"今天: {d.name}")
-    if not c.exists():
-        print("  还没有 scan")
-        return 0
-    packet = json.loads(c.read_text(encoding="utf-8"))
-    print(f"  候选 {len(packet['candidates'])} 个（生成于 {packet['generated_at']}，环境 {packet['environment']}）")
-    print(f"  审核结论: {'已写入' if dec.exists() else '还没有'}")
-    return 0
+    args.what = "status"
+    args.mode = "dry_run"
+    return cmd_swing(args, s)
 
 
 def cmd_regime_bt(args, s) -> int:
@@ -601,7 +588,7 @@ def cmd_fv_t(args, s) -> int:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="wquant", description="Webull 量化交易系统（AI 辅助决策）")
+    p = argparse.ArgumentParser(prog="wquant", description="Webull SOXL/SOXS 三票制双层策略与回测")
     p.add_argument("--config", help="配置文件路径，默认 config.yaml")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -623,17 +610,17 @@ def main(argv=None) -> int:
         if live:
             sp.add_argument("--confirm-live", action="store_true", help="实盘下单的最后一道确认")
 
-    sc = sub.add_parser("scan", help="阶段1：生成今日候选包 decisions/<日期>/candidates.json")
+    sc = sub.add_parser("scan", help="独立个股规则：生成候选包")
     common(sc)
-    sc.add_argument("--force", action="store_true", help="今天已审核过也重新扫描（会覆盖候选包和审核结论）")
-    e = sub.add_parser("execute", help="阶段2：读审核结论 → 风控 → 下单")
+    sc.add_argument("--force", action="store_true", help="重新生成当天候选包")
+    e = sub.add_parser("execute", help="独立个股规则：风控后执行候选")
     common(e, live=True)
-    e.add_argument("--review", choices=["file", "api", "off"], help="审核来源，默认按 ai.mode")
+    e.add_argument("--review", choices=["file", "off"], help=argparse.SUPPRESS)
     e.add_argument("--force", action="store_true", help="今天已经执行过也再执行一次")
-    r = sub.add_parser("run", help="scan + execute（claude_code 模式下只做 scan）")
-    common(r, live=True)
-    r.add_argument("--no-ai", action="store_true", help="跳过审核，纯规则执行")
-    sub.add_parser("status", help="查看今天的候选和审核状态")
+    r = sub.add_parser("run", help="运行 SOXL/SOXS 双层策略（默认只打印订单）")
+    r.add_argument("--mode", choices=["dry_run", "webull"], default="dry_run")
+    r.add_argument("--confirm-live", action="store_true", help="实盘下单的最后一道确认")
+    sub.add_parser("status", help="查看双层策略的仓位和运行状态")
     o = sub.add_parser("orders", help="查看 Webull 账户里本系统下的订单")
     o.add_argument("--days", type=int, default=7)
     o.add_argument("--all", action="store_true", help="显示账户里所有订单（共享沙盒里包括别人的）")

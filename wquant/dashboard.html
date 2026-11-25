@@ -200,17 +200,8 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
   <div class="grid kpis" id="kpis"></div>
 
   <div class="card" style="margin-bottom:14px">
-    <h2>市场研判</h2>
-    <div class="sub" id="viewSub">Claude 每天审核时写的市场环境判断 + 程序计算的情绪指标</div>
-    <div class="view">
-      <div id="viewMain"></div>
-      <div id="viewSentiment"></div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-bottom:14px">
     <h2>半导体短线系统（SOXL / SOXS）</h2>
-    <div class="sub">夜盘 4 个时点：SOXL 相对昨收 ≥±3% 且 KOSPI 同方向 ≥1% → 当天顺势，止损 6%，收盘前平仓；方向由每日市场研判过滤</div>
+    <div class="sub">SOXX 三票决定核心持仓或夜盘战术。战术层在美东 21:00–04:00 连续扫描，使用 SOXL、KOSPI 和价格路径确认。</div>
     <div class="view">
       <div id="swCore"></div>
       <div id="swTac"></div>
@@ -222,7 +213,6 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
     <div class="sub" id="evSub">宏观事件（events.yaml）+ 财报（Webull）；重大事件公布前新开仓位减半，财报前 3 个交易日不买该股票</div>
     <div class="view">
       <div class="scroll" id="evList"></div>
-      <div id="evPlans"></div>
     </div>
   </div>
 
@@ -245,13 +235,8 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
     <div class="scroll" id="positions"></div>
   </div>
 
-  <div class="grid two even">
-    <div class="card">
-      <h2>每日审核记录</h2>
-      <div class="sub">规则层候选 → Claude 审核结论 → 风控 / 下单结果</div>
-      <div id="decisions"></div>
-    </div>
-    <div class="grid" style="align-content:start">
+  <div class="grid">
+    <div class="grid two even">
       <div class="card">
         <h2>订单</h2>
         <div class="sub">本系统在 Webull 下的订单（近 30 天）</div>
@@ -338,9 +323,8 @@ function lineChart(el, rows, series, { height = 240, xKey = "x", fmtX = (x) => x
 // ---------------- 各区块 ----------------
 function renderHeader(d) {
   const env = d.environment === "prod" ? '<span class="chip env-prod">实盘 PROD</span>' : '<span class="chip env-uat">沙盒 UAT</span>';
-  const ai = { claude_code: "审核：Claude Code", api: "审核：Claude API", off: "审核：关闭" }[d.ai_mode] || d.ai_mode;
   $("chips").innerHTML = env + `<span class="chip">区域 ${esc((d.region || "").toUpperCase())}</span>` +
-    `<span class="chip">默认模式 ${esc(d.mode)}</span><span class="chip">${esc(ai)}</span>` +
+    `<span class="chip">默认模式 ${esc(d.mode)}</span>` +
     (d.kill_switch ? '<span class="chip warn">KILL_SWITCH 已开启</span>' : "") + marketChip(d.market);
   $("updated").textContent = "更新于 " + d.generated_at.replace("T", " ");
   const errs = d.errors || {};
@@ -417,32 +401,6 @@ function renderPositions(a) {
     <th class="num">市值</th><th class="num">盈亏</th><th class="num">盈亏%</th><th></th><th class="num">ATR 止损价</th><th class="num">SMA50</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
-const OUTCOME = {
-  submitted: "已提交到 Webull", filled: "已成交（本地模拟）", dry_run: "dry run，未下单",
-  rejected_by_review: "审核否决，未下单", rejected_by_ai: "审核否决，未下单",
-  rejected_by_risk: "风控拦截", error: "下单失败", rejected: "被拒绝", hedge_rejected: "未执行", rejected_by_event: "财报前不开仓",
-};
-
-function renderDecisions(days) {
-  if (!days || !days.length) { $("decisions").innerHTML = '<div class="empty">还没有审核记录。运行 scan，再在 Claude Code 里输入 /trade-review</div>'; return; }
-  $("decisions").innerHTML = days.map((day) => {
-    const items = day.items.length ? day.items.map((it) => {
-      const r = it.review;
-      const tag = !r ? '<span class="tag na">未审核</span>' : r.action === "APPROVE" ? '<span class="tag ok">批准</span>' : '<span class="tag no">否决</span>';
-      const meter = (label, v) => `<span class="meter">${label}<span><i style="width:${(v || 0) * 100}%"></i></span>${(v ?? 0).toFixed(2)}</span>`;
-      const verdict = r ? `${tag}${meter("置信度", r.confidence)}${it.action === "BUY" ? meter("仓位系数", r.conviction) : ""}` : tag;
-      const order = it.order ? ` · ${it.order.side} ${it.order.quantity} 股 ≈ ${fmtUsd(it.order.quantity * it.order.price)}` : "";
-      const notes = it.risk_notes && it.risk_notes.length ? ` · ${it.risk_notes.join("；")}` : "";
-      return `<div class="cand"><div><div class="sym">${esc(it.symbol)}</div><div class="sig">${it.action === "BUY" ? "买入候选" : "卖出信号"} @ ${fmtUsd(it.price, 2)}</div></div>
-        <div><div class="verdict">${verdict}</div>
-        ${r ? `<p class="reason">${esc(r.reasoning)}</p>` : ""}
-        ${r && r.key_risks && r.key_risks.length ? `<ul class="risks">${r.key_risks.map((k) => `<li>${esc(k)}</li>`).join("")}</ul>` : ""}
-        <div class="outcome">规则：${esc(it.rule_reason)}${it.outcome ? " · 结果：" + esc(OUTCOME[it.outcome] || it.outcome) : " · 尚未执行"}${esc(order)}${esc(notes)}</div></div></div>`;
-    }).join("") : '<div class="empty">当天没有候选</div>';
-    return `<div class="day"><div class="day-h"><b>${esc(day.date)}</b><span class="meta">${esc((day.environment || "").toUpperCase())}${day.reviewer ? " · 审核人 " + esc(day.reviewer) : " · 未审核"}</span></div>${items}</div>`;
-  }).join("");
-}
-
 const STATUS = { FILLED: "已成交", CANCELED: "已撤销", SUBMITTED: "已提交", PARTIAL_FILLED: "部分成交", REJECTED: "已拒绝", FAILED: "失败", PENDING: "待处理" };
 function renderOrders(a) {
   if (!a || !a.orders.length) { $("orders").innerHTML = '<div class="empty">暂无订单</div>'; return; }
@@ -472,49 +430,6 @@ function renderBacktest(bt) {
     metric("夏普", m.sharpe) + metric("交易笔数 / 胜率", `${m.trades} / ${(m.win_rate * 100).toFixed(0)}%`);
 }
 
-const REGIME = { risk_off: "偏空", neutral: "中性", risk_on: "偏多" };
-function renderView(days) {
-  const withView = (days || []).filter((d) => d.market_view);
-  const latestDay = (days || [])[0];
-  const v = withView[0];
-  const senti = latestDay && latestDay.sentiment;
-  if (!v) {
-    $("viewMain").innerHTML = '<div class="empty">还没有市场研判。运行 scan 后在 Claude Code 里输入 /trade-review</div>';
-  } else {
-    const mv = v.market_view;
-    const hedges = (v.hedges || []).map((h) => `<li><b>${esc(h.symbol)}</b> 仓位系数 ${(h.conviction ?? 0).toFixed(2)} — ${esc(h.reasoning)}${h.outcome ? `（${esc(OUTCOME[h.outcome] || h.outcome)}${h.reason ? "：" + esc(h.reason) : ""}）` : ""}</li>`).join("");
-    $("viewMain").innerHTML = `
-      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-        <span class="regime ${esc(mv.regime)}">${esc(REGIME[mv.regime] || mv.regime)}</span>
-        <span class="meter">置信度<span><i style="width:${(mv.confidence || 0) * 100}%"></i></span>${(mv.confidence ?? 0).toFixed(2)}</span>
-        <span class="meta">${esc(v.date)}</span>
-      </div>
-      <p class="reason">${esc(mv.summary)}</p>
-      ${(mv.drivers || []).length ? `<h3>主要依据</h3><ul>${mv.drivers.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-      ${(mv.catalysts || []).length ? `<h3>未来关键事件</h3><ul>${mv.catalysts.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-      ${hedges ? `<h3>对冲提议</h3><ul>${hedges}</ul>` : ""}
-      <h3>历史研判</h3>
-      <div class="vhist">${withView.slice(0, 20).map((d) => `<span class="${esc(d.market_view.regime)}" title="${esc(d.market_view.summary)}">${esc(d.date.slice(5))} ${esc(REGIME[d.market_view.regime] || "")} ${(d.market_view.confidence ?? 0).toFixed(1)}</span>`).join("")}</div>`;
-  }
-  if (!senti) { $("viewSentiment").innerHTML = ""; return; }
-  const b = senti.breadth || {};
-  const bar = (label, v, right) => `<div class="hbar"><span>${esc(label)}</span><span class="track"><i style="width:${Math.max(0, Math.min(1, v || 0)) * 100}%"></i></span><span>${right ?? ((v == null ? "—" : Math.round(v * 100) + "%"))}</span></div>`;
-  const chg = b.above_sma50_change_5d;
-  let h = `<h3 style="margin-top:0">市场广度（${esc(latestDay.date)}）</h3>`;
-  h += bar("站上 SMA50", b.above_sma50) + bar("站上 SMA20", b.above_sma20);
-  if (chg != null) h += `<div class="meta">SMA50 广度 5 日变化 ${chg >= 0 ? "+" : "−"}${Math.abs(Math.round(chg * 100))} 个百分点</div>`;
-  const groups = Object.entries(senti.by_group || {});
-  if (groups.length) h += `<h3>各板块站上 SMA50 的比例</h3>` + groups.map(([g, v]) => bar(g, v.above_sma50)).join("");
-  const idx = senti.indices || [];
-  if (idx.length) h += `<h3>指数</h3>` + idx.map((i) => `<div class="meta">${esc(i.symbol)} ${fmtUsd(i.close, 2)} · 20 日 ${fmtPct(i.ret_20d)} · 距 SMA50 ${fmtPct(i.vs_sma50)} · 距 SMA200 ${fmtPct(i.vs_sma200)} · RSI ${i.rsi14}</div>`).join("");
-  const sec = senti.sectors || [];
-  if (sec.length) h += `<h3>板块涨跌家数（Webull）</h3>` + sec.slice(0, 4).map((s) => `<div class="meta">${esc(s.name)}：涨 ${s.advanced} / 跌 ${s.declined} · ${fmtPct(s.change, 2)}</div>`).join("");
-  const flows = Object.entries(senti.capital_flow || {});
-  if (flows.length) h += `<h3>大单净流入（百万美元，近 5 日）</h3>` + flows.map(([s, f]) => `<div class="meta">${esc(s)}：${f.large_net_musd.map((x) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(0)).join(" / ")}</div>`).join("");
-  if (senti.fear_greed) h += `<h3>恐惧贪婪指数</h3><div class="meta">${esc(JSON.stringify(senti.fear_greed).slice(0, 160))}</div>`;
-  $("viewSentiment").innerHTML = h;
-}
-
 function fmtConsensus(c) {
   if (!c) return "—";
   if (typeof c === "string") return esc(c);
@@ -524,8 +439,8 @@ function fmtConsensus(c) {
     return `${esc(k)}: ${esc(val)}`;
   }).join("<br>");
 }
-function renderEvents(evd, days) {
-  if (!evd) { $("evList").innerHTML = ""; $("evPlans").innerHTML = ""; return; }
+function renderEvents(evd) {
+  if (!evd) { $("evList").innerHTML = ""; return; }
   const r = evd.restrictions || {};
   const notes = (r.reasons || []).concat(Object.entries(r.blocked || {}).map(([s, why]) => `${s}：${why}`));
   $("evSub").innerHTML = notes.length ? `<b>当前生效的限制：</b>${notes.map(esc).join("；")}` :
@@ -537,17 +452,7 @@ function renderEvents(evd, days) {
       <td style="white-space:normal;font-size:12px">${fmtConsensus(e.consensus)}</td>
       <td>${e.released ? (e.actual ? "已公布：" + fmtConsensus(e.actual) : "已公布") : (e.hours_until < 48 ? `<b>${Math.round(e.hours_until)} 小时后</b>` : Math.round(e.hours_until / 24) + " 天后")}</td></tr>`).join("")
   }</tbody></table>` : '<div class="empty">未来两周没有记录的事件</div>';
-  const v = (days || []).find((d) => d.market_view);
-  const mv = v && v.market_view;
-  let h = "";
-  (mv?.event_scenarios || []).forEach((es) => {
-    h += `<h3 style="margin-top:0">事件推演：${esc(es.event)}</h3><div class="meta">预期：${esc(es.consensus || "")}</div><ul>` +
-      (es.scenarios || []).map((s) => `<li><b>${esc(s.name)}</b>（${esc(s.condition)}）：${esc(s.expected_reaction)} → ${esc(s.system_response)}</li>`).join("") + "</ul>";
-  });
-  (mv?.event_reviews || []).forEach((er) => {
-    h += `<h3>事件复盘：${esc(er.event)}</h3><div class="meta">实际：${esc(er.actual)} · 反应：${esc(er.market_reaction)} · 命中情景：${esc(er.matched_scenario)}</div>${er.lesson ? `<p class="reason">${esc(er.lesson)}</p>` : ""}`;
-  });
-  $("evPlans").innerHTML = h || '<div class="empty">还没有事件推演。重大事件前一天的 /trade-review 会写三种情景和应对</div>';
+
 }
 
 function renderSwing(sw) {
@@ -563,12 +468,11 @@ function renderSwing(sw) {
   h += `<div class="chart" id="swEq" style="margin-top:8px"></div>`;
   h += `<h3>今晚的方向限制（交易日 ${esc(sw.next_day)}）</h3><div class="meta">${esc(sw.gate || "")}</div>`;
   h += `<h3>核心层（日线长周期）</h3>`;
-  if (c) {
-    const n = Math.round((c.weight || 0) * 3);
-    h += `<div class="hbar"><span>看多规则</span><span class="track"><i style="width:${(c.weight || 0) * 100}%"></i></span><span>${n}/3</span></div>
-      <div class="meta">${esc(cfg.core?.index || "SOXX")} 截至 ${esc(c.index_date)} · 目标 ${esc(cfg.core?.long || "SOXL")} ${c.target_qty} 股 · 上次运行 ${esc((c.ts || "").replace("T", " "))}</div>`;
-  } else h += '<div class="meta">还没运行过：.venv/bin/python -m wquant swing core</div>';
-  h += `<div class="meta">${cfg.core?.enabled === false ? "已关闭（当前不是牛市）" : "当前持仓：" + bookTxt("core")}</div>`;
+  if (c?.last_votes != null) {
+    const trend = {1: "上涨", 0: "震荡", "-1": "下跌"}[c.last_regime];
+    h += `<div class="meta">最新三票 ${esc(c.last_votes)} · ${esc(trend || "")}${c.stopped ? " · 止损后等待反弹" : ""}</div>`;
+  }
+  h += `<div class="meta">当前持仓：${bookTxt("core")}</div>`;
   $("swCore").innerHTML = h;
   if (hist.length >= 2) lineChart($("swEq"), [{ x: "起点", equity: cap }, ...hist], [{ key: "equity", label: "系统权益", color: "--series-1" }], { height: 140, fmtX: (x) => x.slice(5), fmtY: (v, full) => fmtUsd(v, full ? 2 : 0) });
   const t = sw.tactical || [];
@@ -612,8 +516,8 @@ function renderCombined(c) {
 let last = null;
 function renderAll(d) {
   last = d;
-  renderHeader(d); renderCombined(d.combined); renderView(d.decisions); renderEvents(d.events, d.decisions); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
-  renderPositions(d.account); renderDecisions(d.decisions); renderOrders(d.account); renderBacktest(d.backtest);
+  renderHeader(d); renderCombined(d.combined); renderEvents(d.events); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
+  renderPositions(d.account); renderOrders(d.account); renderBacktest(d.backtest);
 }
 
 async function load(force) {

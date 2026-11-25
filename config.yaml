@@ -26,7 +26,7 @@ mode: dry_run
 # 另外运行时还需要加 --confirm-live 参数。三道锁缺一不可。
 live_trading_enabled: false
 
-# ---- 规则层：技术面筛选（产生候选，AI 只能在候选里做决定）----
+# ---- 独立个股筛选规则 ----
 strategy:
   sma_fast: 50
   sma_slow: 200
@@ -54,26 +54,17 @@ strategy:
     ma: sma_slow             # sma_slow = SMA200（长期趋势）；sma_fast = SMA50（更敏感）
     mode: any                # any = 任一指数走弱就停；all = 全部走弱才停
 
-# ---- 审核层 ----
+# ---- 独立个股候选扫描 ----
 ai:
-  # claude_code - 由 Claude Code 审核候选并写 decisions.json（用订阅额度，程序不调用付费 API）
-  # api         - 程序直接调用 Claude API（按 token 计费，需要 ANTHROPIC_API_KEY）
-  # off         - 不审核，规则信号直接进入风控
-  mode: claude_code
-  min_confidence: 0.6      # 低于此置信度的 BUY 不执行
-  news_items: 8            # 每只股票放进候选包的新闻条数
-  # 审核能否否决规则层的卖出信号？默认不能——止损永远优先
-  can_veto_exits: false
-  # 以下仅 mode: api 时使用
-  api_model: claude-opus-5-5
-  api_effort: high
+  mode: "off"
+  news_items: 8
 
 # ---- 情绪指标（scan 时计算，写进候选包）----
 sentiment:
   sectors: [Semiconductor, Software, Technology]   # Webull 板块涨跌家数，按名称关键字匹配
   flow_symbols: [QQQ, SOXL, SOXS]                  # 看大单资金流向的标的
 
-# ---- 对冲：Claude 市场研判偏空时可以开的小额对冲仓位（不需要均线信号）----
+# ---- 独立个股规则的旧版对冲配置 ----
 hedge:
   enabled: false               # 做空一侧改由 swing 战术层负责（回测验证过），这里关闭避免重复
   instruments: [SOXS]          # 只允许这些标的做对冲，而且必须在标的池里
@@ -132,11 +123,8 @@ scalp:
   slippage_bps: 3              # 每次成交的额外滑点，单位 bp
   fee_per_order: 0.10          # 每次成交的模拟费用（美元）
 
-# ===== 半导体短线系统（SOXL / SOXS）=====
-# 战术层：夜盘 4 个检查时点，SOXL 相对昨收 ≥±3% 且 KOSPI 综合指数同方向 ≥1% → 当天顺势买 SOXL / SOXS，
-#         仓位按信号强弱 33%～66%；盘前 / 常规时段盈利加仓到 130%；止损 6%、加仓后回撤 6% 止盈，卖出后反弹 3% 买回（不限次数）；
-#         收盘前平仓，不持仓过夜；方向再由 Claude 每天的市场研判过滤（这一层没法回测）。
-# 核心层：日线长周期只做多。现在不是牛市，先关闭。
+# ===== SOXL / SOXS 三票制双层策略 =====
+# 核心层与夜盘战术层共享独立本金。按三票结果切换方向，并按规则直接执行。
 swing:
   core:
     enabled: false
@@ -170,20 +158,18 @@ swing:
     trail_pct: 0.07          # 第 1 腿移动止损：从持仓最高价回撤 7% 就卖，之后反弹 3% 买回
     # 三票制双层动态切换（沙盒逻辑，研究回放结果见 README）：
     #   SOXX 三票（Donchian 20/10 + SMA50/Mom20 + EMA 10/30）>= +2 票：核心层全仓持 SOXL 过夜，
-    #   挂单日 12% 急跌止损；止损后次日起盘中从低点反弹 5% 买回；等待期战术层仅顺势做多。
+    #   按成交均价设 12% 固定止损；次日起按当天常规盘低点反弹 5% 买回；等待期战术层仅顺势做多。
     #   三票 < +2 票：清空核心仓，切入 5 分钟夜盘抢跑战术层（<= -2 票时只做空 SOXS，禁做多）。
     trend_switch:
       enabled: true
       index: SOXX
       core_symbol: SOXL
       core_frac: 1.0
-      day_stop_pct: 0.12
+      stop_pct: 0.12
       rebuy_pct: 0.05
       core_session_start: "09:30"
     poll_seconds: 60
     sides: [long, short]
-    view_gate: true          # 用 Claude 当天的市场研判过滤方向
-    view_min_confidence: 0.7 # 研判置信度达到这个值才限制方向
     path:
       enabled: true
       scan: continuous       # 21:00–04:00 ET 每分钟连续扫描
