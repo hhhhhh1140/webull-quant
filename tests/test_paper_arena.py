@@ -83,11 +83,43 @@ def test_eval_macro_short_gate_no_lookahead_and_both_required():
     ok2, note2 = SL.eval_macro_short_gate(DAY, cfg, fetcher=lambda s: {"^IRX": irx_up, "^TNX": tnx_dn}[s])
     assert ok2 is False and "禁夜盘做空 SOXS" in note2
 
-    # Network error conservatively blocks shorting
+    # Network error returns None (conservatively blocks this tick without locking the whole session)
     def boom(_):
         raise RuntimeError("timeout")
     ok3, note3 = SL.eval_macro_short_gate(DAY, cfg, fetcher=boom)
-    assert ok3 is False and "保守禁夜盘做空 SOXS" in note3
+    assert ok3 is None and "下轮继续重试" in note3
+
+
+def test_macro_gate_failure_does_not_lock_session_and_retries_next_tick(tmp_path, monkeypatch):
+    monkeypatch.setattr(journal, "STATE", tmp_path / "state")
+    monkeypatch.setattr(journal, "LOGS", tmp_path / "logs")
+    monkeypatch.setattr(SL, "KILL_SWITCH", tmp_path / "KILL_SWITCH")
+
+    class FlakyMacroMarket(ArenaFakeMarket):
+        def __init__(self):
+            super().__init__({"SOXL": 96.0, "SOXS": 20.0}, {"SOXL": 100.0}, kospi=-0.02, macro_ok=True)
+            self.attempts = 0
+
+        def macro_short_allowed(self, day, gate_cfg):
+            if not (gate_cfg or {}).get("enabled"):
+                return True, ""
+            self.attempts += 1
+            if self.attempts == 1:
+                return None, "利率门控拉取失败 → 本轮保守禁做空 SOXS，下轮继续重试"
+            return True, "利率双紧缩 → 允许夜盘做空 SOXS"
+
+    base = load_settings(environment="uat")
+    md = FlakyMacroMarket()
+    cached = SL.CachedMarket(md)
+    runners = PA.build_arena_runners(base, ["plan_a"], a_mode="paper")
+
+    # Tick 1 (21:00): fetch fails -> does NOT open SOXS, and leaves macro_short_allowed=None (not locked)
+    s1 = PA.run_arena_tick(runners, cached, at("21:00"), day=DAY)["plan_a"]
+    assert s1.qty == 0 and s1.macro_short_allowed is None and md.attempts == 1
+
+    # Tick 2 (21:01): retries immediately (not cached) -> succeeds and opens SOXS
+    s2 = PA.run_arena_tick(runners, cached, at("21:01"), day=DAY)["plan_a"]
+    assert s2.macro_short_allowed is True and s2.qty > 0 and s2.symbol == "SOXS" and md.attempts == 2
 
 
 def test_three_profiles_config_and_ledger_isolation(tmp_path, monkeypatch):

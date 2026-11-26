@@ -147,32 +147,65 @@ def _kospi_prev_close(kday: date) -> float | None:
 
 
 _MACRO_GATE_CACHE: dict[tuple, tuple[bool, str]] = {}
+_FRED_FALLBACK = {"^IRX": "DTB3", "^TNX": "DGS10"}
 
 
-def fetch_yahoo_daily_closes(symbol: str, range_: str = "1y") -> pd.Series:
-    """拉取 Yahoo Finance 日线收盘价（美东交易日索引），供宏观利率门控使用。"""
+def fetch_fred_daily_closes(symbol: str) -> pd.Series:
+    """备源：从圣路易斯联储 FRED 公开 CSV 拉取近 1 年美债收益率日线（免密钥，6 秒快速超时）。"""
+    import io
+    import requests
+    series_id = _FRED_FALLBACK.get(symbol.upper())
+    if not series_id:
+        raise RuntimeError(f"FRED 不支持 {symbol}")
+    since = (date.today() - timedelta(days=400)).isoformat()
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={since}"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    date_col, val_col = df.columns[0], df.columns[1]
+    vals = pd.to_numeric(df[val_col], errors="coerce")
+    dates = pd.to_datetime(df[date_col]).dt.date
+    s = pd.Series(vals.to_numpy(), index=dates, dtype=float).dropna()
+    return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+def fetch_yahoo_daily_closes(symbol: str, range_: str = "1y", retries: int = 3) -> pd.Series:
+    """拉取 Yahoo Finance 日线收盘价（query1/query2 交替重试），失败后快速尝试 FRED 备源。"""
     from urllib.parse import quote
     import requests
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+    hosts = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
     last_exc: Exception | None = None
-    for _ in range(2):
+    for attempt in range(max(1, retries)):
+        host = hosts[attempt % len(hosts)]
+        url = f"https://{host}/v8/finance/chart/{quote(symbol, safe='')}"
         try:
             r = requests.get(url, params={"interval": "1d", "range": range_},
-                             headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             r.raise_for_status()
             j = r.json()["chart"]["result"][0]
             days = pd.to_datetime(j["timestamp"], unit="s", utc=True).tz_convert("America/New_York").date
             closes = j["indicators"]["quote"][0]["close"]
             s = pd.Series(closes, index=days, dtype=float).dropna()
-            return s[~s.index.duplicated(keep="last")].sort_index()
+            if not s.empty:
+                return s[~s.index.duplicated(keep="last")].sort_index()
         except Exception as exc:
             last_exc = exc
+        if attempt + 1 < retries:
+            _time.sleep(0.8 * (attempt + 1))
+    if symbol.upper() in _FRED_FALLBACK:
+        try:
+            s = fetch_fred_daily_closes(symbol)
+            if not s.empty:
+                return s
+        except Exception as fred_exc:
+            last_exc = fred_exc
     raise RuntimeError(f"无法拉取 {symbol} 日线：{last_exc}")
 
 
-def eval_macro_short_gate(day: date, gate_cfg: dict, fetcher=fetch_yahoo_daily_closes) -> tuple[bool, str]:
+def eval_macro_short_gate(day: date, gate_cfg: dict, fetcher=fetch_yahoo_daily_closes) -> tuple[bool | None, str]:
     """评估宏观利率紧缩门控（仅用 < day 已完成美东日线，无未来函数）。
-    当全部 symbols 的最新收盘价 > SMA(sma_window) 时返回 True，否则禁止夜盘做空 SOXS。"""
+    返回 (True/False, 说明)；若网络拉取失败或数据暂缺则返回 (None, 说明)，
+    调用方本轮保守禁做空但不锁死当天状态，下轮继续重试拉取。"""
     if not (gate_cfg or {}).get("enabled"):
         return True, ""
     symbols = tuple(gate_cfg.get("symbols") or ("^IRX", "^TNX"))
@@ -188,8 +221,7 @@ def eval_macro_short_gate(day: date, gate_cfg: dict, fetcher=fetch_yahoo_daily_c
             s = fetcher(sym)
             s = s[s.index < day]
             if len(s) < window:
-                res = (False, f"利率门控：{sym} 有效日线不足 {window} 根 → 暂禁夜盘做空 SOXS")
-                return res
+                return None, f"利率门控：{sym} 有效日线不足 {window} 根 → 本轮保守禁做空 SOXS，下轮继续重试"
             last_val = float(s.iloc[-1])
             sma_val = float(s.iloc[-window:].mean())
             ok = last_val > sma_val
@@ -197,7 +229,7 @@ def eval_macro_short_gate(day: date, gate_cfg: dict, fetcher=fetch_yahoo_daily_c
                 all_up = False
             parts.append(f"{sym} {last_val:.2f}{'>' if ok else '<='}SMA{window}({sma_val:.2f})")
     except Exception as exc:
-        return False, f"利率门控拉取失败（{exc}）→ 保守禁夜盘做空 SOXS"
+        return None, f"利率门控拉取失败（{exc}）→ 本轮保守禁做空 SOXS，下轮继续重试"
     verdict = "允许夜盘做空 SOXS" if all_up else "未双紧缩，禁夜盘做空 SOXS"
     res = (all_up, f"利率门控：{' 且 '.join(parts)} → {verdict}")
     if use_cache:
@@ -374,13 +406,20 @@ class CachedMarket:
     def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]:
         return self._get(("path", sym, day), self.quote_ttl, lambda: self.inner.path_stats(sym, day))
 
-    def macro_short_allowed(self, day: date, gate_cfg: dict) -> tuple[bool, str]:
+    def macro_short_allowed(self, day: date, gate_cfg: dict) -> tuple[bool | None, str]:
         syms = tuple((gate_cfg or {}).get("symbols") or ())
         win = int((gate_cfg or {}).get("sma_window") or 60)
         key = ("macro", day, bool((gate_cfg or {}).get("enabled")), syms, win)
-        return self._get(key, self.slow_ttl, lambda: eval_macro_short_gate(day, gate_cfg)
-                         if not hasattr(self.inner, "macro_short_allowed")
-                         else self.inner.macro_short_allowed(day, gate_cfg))
+        now_t = _time.monotonic()
+        hit = self._cache.get(key)
+        if hit is not None and now_t - hit[0] <= self.slow_ttl:
+            return hit[1]
+        val = (eval_macro_short_gate(day, gate_cfg)
+               if not hasattr(self.inner, "macro_short_allowed")
+               else self.inner.macro_short_allowed(day, gate_cfg))
+        if val[0] is not None:  # 拉取失败时不缓存，确保下轮立即重试
+            self._cache[key] = (now_t, val)
+        return val
 
 
 # ---------------------------------------------------------------- 下单
@@ -939,14 +978,26 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         allowed, direction_note = tactical_directions(t, st.trend_regime if dual else None)
         macro_cfg = t.get("macro_short_gate") or {}
         if macro_cfg.get("enabled"):
-            if st.macro_short_allowed is None:
+            macro_ok = st.macro_short_allowed
+            if macro_ok is None:
                 if hasattr(md, "macro_short_allowed"):
-                    st.macro_short_allowed, st.macro_short_note = md.macro_short_allowed(day, macro_cfg)
+                    fetched_ok, fetched_note = md.macro_short_allowed(day, macro_cfg)
                 else:
-                    st.macro_short_allowed, st.macro_short_note = eval_macro_short_gate(day, macro_cfg)
-                if st.macro_short_note:
-                    note(st.macro_short_note)
-            if not st.macro_short_allowed:
+                    fetched_ok, fetched_note = eval_macro_short_gate(day, macro_cfg)
+                if fetched_ok is not None:
+                    # 拿到确定结果后锁定当天状态
+                    st.macro_short_allowed = fetched_ok
+                    st.macro_short_note = fetched_note
+                    if fetched_note:
+                        note(fetched_note)
+                    macro_ok = fetched_ok
+                else:
+                    # 拉取失败时不锁死，下轮继续重试拉取；本轮保守禁空
+                    if fetched_note and fetched_note != st.macro_short_note:
+                        st.macro_short_note = fetched_note
+                        note(fetched_note)
+                    macro_ok = False
+            if not macro_ok:
                 allowed = allowed - {"short"}
                 if not allowed:
                     direction_note = "三票仅允许做空，但利率门控禁做空 SOXS"
