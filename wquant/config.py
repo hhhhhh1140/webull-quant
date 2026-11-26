@@ -54,12 +54,12 @@ class Settings:
         return bool(self.app_key and self.app_secret)
 
 
-def load_settings(config_path: str | os.PathLike | None = None) -> Settings:
+def load_settings(config_path: str | os.PathLike | None = None, *, environment: str | None = None) -> Settings:
     load_dotenv(ROOT / ".env")
     path = Path(config_path) if config_path else ROOT / "config.yaml"
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
-    env = os.environ.get("WEBULL_ENVIRONMENT", "uat").strip().lower()
+    env = (environment if environment is not None else os.environ.get("WEBULL_ENVIRONMENT", "uat")).strip().lower()
     if env not in ("uat", "prod"):
         raise ValueError(f"WEBULL_ENVIRONMENT 必须是 uat 或 prod，当前为 {env!r}")
     # 沙盒和实盘用不同的密钥：uat 读 WEBULL_SANDBOX_APP_KEY/SECRET，prod 读 WEBULL_APP_KEY/SECRET

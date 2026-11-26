@@ -1,0 +1,7 @@
+date,symbol,prev_rth_close,overnight_last,futu_m5_open,futu_m5_low,futu_m5_high,futu_m5_close,first_futu_m1_close,first_futu_m1_volume,webull_first_five_low,webull_first_five_high,from_overnight_jump,first_open_equals_prev,next_open_equals_prev,retained_low,retained_high,systematic_flag,in_six
+2026-07-28,SOXS,54.93,60.23,54.93,54.93,60.7,59.99,60.61,191442.0,58.8,60.77,-0.08799601527477996,True,False,58.8,60.7,True,True
+2026-07-29,SOXS,62.87,65.85,62.87,62.87,66.0,65.39,65.77,412972.0,64.91,68.02,-0.04525436598329535,True,False,64.9,66.0,True,True
+2026-10-29,SOXS,39.78,43.28,39.78,39.78,43.52,43.15,43.03,662625.830452,42.98,43.4,-0.08086876155268019,True,False,42.99,43.52,True,True
+2026-10-30,SOXS,41.68,48.52,41.68,41.68,48.98,48.89,48.67,581883.389862,48.25,48.98,-0.1409727947238253,True,False,48.66,48.98,True,True
+2026-11-05,SOXS,58.34,62.48,58.34,58.34,63.89,63.62,62.91,614343.665317,62.18,63.88,-0.0662612035851472,True,False,62.91,63.89,True,True
+2026-11-20,SOXS,63.14,67.34,63.14,63.14,68.38,68.3799,67.7,839039.656173,66.83,68.38,-0.062370062370062374,True,False,67.55,68.38,True,True

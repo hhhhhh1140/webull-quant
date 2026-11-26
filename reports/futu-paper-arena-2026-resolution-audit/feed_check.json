@@ -1,0 +1,20 @@
+{
+  "SOXL": {
+    "compared_bars": 65616,
+    "prices_differ_by_half_cent": {
+      "open": 72,
+      "high": 24,
+      "low": 14,
+      "close": 0
+    }
+  },
+  "SOXS": {
+    "compared_bars": 65616,
+    "prices_differ_by_half_cent": {
+      "open": 151,
+      "high": 24,
+      "low": 31,
+      "close": 0
+    }
+  }
+}

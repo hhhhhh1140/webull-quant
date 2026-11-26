@@ -126,6 +126,7 @@ scalp:
 # ===== SOXL / SOXS 三票制双层策略 =====
 # 核心层与夜盘战术层共享独立本金。按三票结果切换方向，并按规则直接执行。
 swing:
+  market_source: futu          # 统一使用富途 OpenD 24h 1m/5m/日线行情（含夜盘，实盘免 Webull 夜盘订阅；可改 webull / auto）
   core:
     enabled: false
     index: SOXX
@@ -145,7 +146,8 @@ swing:
     reentry: true
     rebound_pct: 0.03        # 卖出后从最低点反弹 3% 就按原方向买回
     max_reentries: 1         # 最多买回 1 次（日内只用 1 次 6% 窄止损）
-    reentry_stop_pct: 0.12   # 第 2 腿改用 12% 兜底止损（不设 7% 移动止盈，尾盘必平）
+    reentry_position_frac: 1.0   # 第 2 腿使用买回时的策略资金
+    reentry_stop_pct: 0.06       # 第 2 腿成本下方 6% 固定止损，尾盘必平
     last_reentry: "15:00"
     # 全仓模式不融资、不加仓
     max_frac_ovn: 1.0
@@ -155,21 +157,27 @@ swing:
     add_from: "04:00"
     add_last: "15:00"
     trail_after_add: null
-    trail_pct: 0.07          # 第 1 腿移动止损：从持仓最高价回撤 7% 就卖，之后反弹 3% 买回
+    trail_pct: 0.08          # 第 1 腿移动止损：从持仓最高价回撤 8% 就卖，之后反弹 3% 买回
     # 三票制双层动态切换（沙盒逻辑，研究回放结果见 README）：
     #   SOXX 三票（Donchian 20/10 + SMA50/Mom20 + EMA 10/30）>= +2 票：核心层全仓持 SOXL 过夜，
-    #   按成交均价设 12% 固定止损；次日起按当天常规盘低点反弹 5% 买回；等待期战术层仅顺势做多。
+    #   从日内最高价回撤 12% 止损；次日起在常规盘较上一交易日常规盘收盘价上涨 5% 买回。
     #   三票 < +2 票：清空核心仓，切入 5 分钟夜盘抢跑战术层（<= -2 票时只做空 SOXS，禁做多）。
     trend_switch:
       enabled: true
       index: SOXX
       core_symbol: SOXL
       core_frac: 1.0
-      stop_pct: 0.12
+      trail_pct: 0.12
       rebuy_pct: 0.05
+      rebuy_session: RTH
       core_session_start: "09:30"
     poll_seconds: 60
     sides: [long, short]
+    # 宏观利率门控（A 版）：^IRX（13周短债）且 ^TNX（10年美债）昨日收盘均高于 60 日均线才允许夜盘做空 SOXS
+    macro_short_gate:
+      enabled: true
+      symbols: ["^IRX", "^TNX"]
+      sma_window: 60
     path:
       enabled: true
       scan: continuous       # 21:00–04:00 ET 每分钟连续扫描

@@ -1,7 +1,7 @@
 """半导体波段系统的实盘 / 沙盒运行。两层，各自记账，互不干扰：
 
 核心层（core）：每天一次。三条只做多趋势规则（SOXX 日线）的组合权重 → SOXL 目标仓位，偏差超过阈值才调仓。
-战术层（tactical）：每个交易日一个监控进程。
+战术层（tactical）：按美股交易日运行，核心仓监控覆盖夜盘至盘后。
     04:00 ET（夜盘结束）看 SOXL 相对昨收涨跌 + 韩国（EWY）确认 → 顺势买 SOXL 或 SOXS
     软件止损（持有标的跌 stop_pct），止损后从最低点反弹 rebound_pct 买回一次
     15:55 ET 全部平仓，不留隔夜
@@ -31,6 +31,7 @@ ET = ZoneInfo("America/New_York")
 # ---------------------------------------------------------------- 配置
 DEFAULTS = {
     "capital": 100_000,
+    "market_source": "webull",   # webull | futu | auto（futu 统一使用富途 OpenD 24h 1m/5m/日线，实盘免 Webull 夜盘订阅）
     "core": {"enabled": True, "index": "SOXX", "long": "SOXL", "allocation": 0.30, "rebalance_band": 0.05},
     "tactical": {"enabled": True, "long": "SOXL", "short": "SOXS",
                  "checkpoints": ["21:00", "23:00", "01:30", "04:00"],   # 美东；21:00/23:00 属于前一天晚上
@@ -40,11 +41,13 @@ DEFAULTS = {
                  "stop_pct": 0.06, "reentry": True, "rebound_pct": 0.03, "last_reentry": "15:00",
                  "max_reentries": None,                                  # 一天买回次数不限
                  "reentry_stop_pct": None,                               # 买回后第 2 腿兜底止损（None = 沿用 stop_pct/trail_pct）
-                 # 三票制双层动态切换：上涨趋势拿核心 SOXL 过夜（按入场均价设 12% 止损、次日起按当天低点反弹 5% 买回）；
+                 "reentry_position_frac": None,                          # None = 沿用首腿的仓位比例
+                 "reentry_trail_pct": None,                              # 从本次买回后的最高价计算
+                 # 三票制双层动态切换：上涨趋势拿核心 SOXL 过夜（从当日最高价回撤 12% 止损、次日起较上一交易日常规盘收盘价上涨 5% 买回）；
                  # 非上涨趋势清空核心、切入战术层（下跌趋势只做空 SOXS，震荡期双向）
                  "trend_switch": {"enabled": False, "index": "SOXX", "core_symbol": "SOXL",
-                                  "core_frac": 1.0, "stop_pct": 0.12, "rebuy_pct": 0.05,
-                                  "core_session_start": "09:30"},
+                                  "core_frac": 1.0, "trail_pct": 0.12, "rebuy_pct": 0.05,
+                                  "core_session_start": "09:30", "rebuy_session": "ALL"},
                  # 融资与盈利加仓：夜盘不能融资（最多 100%），盘前 / 常规时段最多 130%
                  "max_frac_ovn": 1.0, "max_frac": 1.3,
                  "add_step": 0.03, "add_frac": 0.33, "add_from": "04:00", "add_last": "15:00",
@@ -60,6 +63,8 @@ DEFAULTS = {
                           "reversal_korea": True,   # 反转信号是否也要韩国确认
                           "scan": "checkpoints",
                           "scan_from": None, "scan_to": None},  # 连续扫描的起止时间（美东），None = 第一个 / 最后一个检查时点   # checkpoints = 只在检查时点判断；continuous = 首个到最后一个时点之间每次轮询都判断
+                 # 宏观利率门控：开启后要求全部利率标的（如 ^IRX、^TNX）昨日收盘均高于 SMA(window)，才允许夜盘做空 SOXS
+                 "macro_short_gate": {"enabled": False, "symbols": ["^IRX", "^TNX"], "sma_window": 60},
                  # 动态仓位 = base × 信号强弱倍数 × 趋势效率系数，限制在 [min, max]
                  "sizing": {"mode": "dynamic", "base": 0.33, "signal_cap": 2.0, "use_trend_efficiency": False,
                             "trend_index": "SOXX", "er_window": 10, "er_tiers": [[0.2, 0.6], [0.4, 1.0], [99, 1.3]],
@@ -82,8 +87,10 @@ def swing_cfg(settings: Settings) -> dict:
     overrides = settings.section("swing")
     cfg = _deep_merge(json.loads(json.dumps(DEFAULTS)), overrides)
     old = (overrides.get("tactical") or {}).get("trend_switch") or {}
-    if "day_stop_pct" in old and "stop_pct" not in old:
-        cfg["tactical"]["trend_switch"]["stop_pct"] = old["day_stop_pct"]
+    if "trail_pct" not in old:
+        previous_pct = old.get("stop_pct", old.get("day_stop_pct"))
+        if previous_pct is not None:
+            cfg["tactical"]["trend_switch"]["trail_pct"] = previous_pct
     return cfg
 
 
@@ -111,8 +118,8 @@ class Books:
 # ---------------------------------------------------------------- 行情接口（方便测试时替换）
 class Market(Protocol):
     def last_price(self, sym: str) -> tuple[datetime, float]: ...
+    def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None: ...
     def prev_rth_close(self, sym: str, day: date) -> float: ...
-    def rth_low(self, sym: str, day: date, now: datetime) -> float | None: ...
     def daily(self, sym: str, count: int) -> pd.DataFrame: ...
     def kospi_move(self, now: datetime) -> float | None: ...
     def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]: ...
@@ -139,31 +146,163 @@ def _kospi_prev_close(kday: date) -> float | None:
     return closes[-1] if closes else None
 
 
+_MACRO_GATE_CACHE: dict[tuple, tuple[bool, str]] = {}
+
+
+def fetch_yahoo_daily_closes(symbol: str, range_: str = "1y") -> pd.Series:
+    """拉取 Yahoo Finance 日线收盘价（美东交易日索引），供宏观利率门控使用。"""
+    from urllib.parse import quote
+    import requests
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+    last_exc: Exception | None = None
+    for _ in range(2):
+        try:
+            r = requests.get(url, params={"interval": "1d", "range": range_},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+            r.raise_for_status()
+            j = r.json()["chart"]["result"][0]
+            days = pd.to_datetime(j["timestamp"], unit="s", utc=True).tz_convert("America/New_York").date
+            closes = j["indicators"]["quote"][0]["close"]
+            s = pd.Series(closes, index=days, dtype=float).dropna()
+            return s[~s.index.duplicated(keep="last")].sort_index()
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"无法拉取 {symbol} 日线：{last_exc}")
+
+
+def eval_macro_short_gate(day: date, gate_cfg: dict, fetcher=fetch_yahoo_daily_closes) -> tuple[bool, str]:
+    """评估宏观利率紧缩门控（仅用 < day 已完成美东日线，无未来函数）。
+    当全部 symbols 的最新收盘价 > SMA(sma_window) 时返回 True，否则禁止夜盘做空 SOXS。"""
+    if not (gate_cfg or {}).get("enabled"):
+        return True, ""
+    symbols = tuple(gate_cfg.get("symbols") or ("^IRX", "^TNX"))
+    window = int(gate_cfg.get("sma_window") or 60)
+    use_cache = fetcher is fetch_yahoo_daily_closes
+    cache_key = (day, symbols, window)
+    if use_cache and cache_key in _MACRO_GATE_CACHE:
+        return _MACRO_GATE_CACHE[cache_key]
+    parts = []
+    all_up = True
+    try:
+        for sym in symbols:
+            s = fetcher(sym)
+            s = s[s.index < day]
+            if len(s) < window:
+                res = (False, f"利率门控：{sym} 有效日线不足 {window} 根 → 暂禁夜盘做空 SOXS")
+                return res
+            last_val = float(s.iloc[-1])
+            sma_val = float(s.iloc[-window:].mean())
+            ok = last_val > sma_val
+            if not ok:
+                all_up = False
+            parts.append(f"{sym} {last_val:.2f}{'>' if ok else '<='}SMA{window}({sma_val:.2f})")
+    except Exception as exc:
+        return False, f"利率门控拉取失败（{exc}）→ 保守禁夜盘做空 SOXS"
+    verdict = "允许夜盘做空 SOXS" if all_up else "未双紧缩，禁夜盘做空 SOXS"
+    res = (all_up, f"利率门控：{' 且 '.join(parts)} → {verdict}")
+    if use_cache:
+        _MACRO_GATE_CACHE[cache_key] = res
+    return res
+
+
 KOSPI_CLOSE_KST = time(15, 35)   # 15:30 收盘，留 5 分钟让官方收盘价出来
+
+
+def fetch_kospi_move(now: datetime) -> float | None:
+    """KOSPI 当天涨跌（相对上一交易日收盘），用 Yahoo 5 分钟线，只取已收盘的 K 线。"""
+    import requests
+    from .intraday_data import KOSPI_URL
+    r = requests.get(KOSPI_URL, params={"interval": "5m", "range": "5d"},
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    j = r.json()["chart"]["result"][0]
+    ts = pd.to_datetime(j["timestamp"], unit="s", utc=True) + pd.Timedelta(minutes=5)
+    df = pd.DataFrame({"close": j["indicators"]["quote"][0]["close"]}, index=ts).dropna()
+    df = df[df.index <= pd.Timestamp(now).tz_convert("UTC")]
+    if df.empty:
+        return None
+    kday = (df.index.tz_convert("Asia/Seoul") - pd.Timedelta(minutes=5)).date
+    last_day = kday[-1]
+    today_kst = pd.Timestamp(now).tz_convert("Asia/Seoul").date()
+    if last_day != today_kst:
+        return None                      # 今天韩国休市或还没开盘：不拿昨天的数据冒充
+    daily = _kospi_daily_closes()
+    prevs = [c for d, c in daily if d < last_day]
+    prev_close = prevs[-1] if prevs else None
+    if prev_close is None:
+        prev = df[kday < last_day]
+        if prev.empty:
+            return None
+        prev_close = float(prev.close.iloc[-1])
+    cur = float(df.close.iloc[-1])
+    if pd.Timestamp(now).tz_convert("Asia/Seoul").time() >= KOSPI_CLOSE_KST:
+        today = [c for d, c in daily if d == last_day]
+        if today:
+            cur = today[-1]
+    return float(cur / prev_close - 1)
+
+
+def make_market(settings: Settings, now: Callable[[], datetime], *, source: str | None = None, client=None) -> Market:
+    """按配置创建实时行情源（futu / webull / auto）。"""
+    chosen = (source or swing_cfg(settings).get("market_source") or "webull").strip().lower()
+    if chosen == "futu":
+        from .futu_gateway import FutuMarket
+        return FutuMarket(now)
+    if chosen == "auto":
+        try:
+            from .futu_gateway import FutuMarket
+            fm = FutuMarket(now)
+            fm.last_price(swing_cfg(settings)["tactical"]["long"])
+            return fm
+        except Exception as exc:
+            print(f"[market] 富途行情不可用（{exc}），回退到 Webull 行情")
+    if client is None:
+        from .webull_client import WebullClient
+        for attempt in range(1, 11):
+            try:
+                client = WebullClient(settings)
+                break
+            except Exception as e:
+                if attempt == 10:
+                    raise
+                print(f"[swing] 连接 Webull 失败（第 {attempt}/10 次），10 秒后重试：{e}")
+                _time.sleep(10)
+    return WebullMarket(client, now)
 
 
 class WebullMarket:
     def __init__(self, client, now: Callable[[], datetime]):
         self.c, self.now = client, now
 
-    def _bars(self, sym: str, ts: str, count: int) -> pd.DataFrame:
+    def _bars(self, sym: str, ts: str, count: int, **kwargs) -> pd.DataFrame:
         from .intraday_data import SESSIONS, _to_frame
         from .webull_client import _json, _unwrap_list
         d = _unwrap_list(_json(self.c.data.market_data.get_batch_history_bar(
-            [sym], "US_STOCK", ts, count=str(count), trading_sessions=SESSIONS)))
+            [sym], "US_STOCK", ts, count=str(count), trading_sessions=SESSIONS, **kwargs)))
         return _to_frame(d[0]["result"]) if d else pd.DataFrame()
 
     def last_price(self, sym: str) -> tuple[datetime, float]:
         b = self._bars(sym, "M1", 3)
         return b.index[-1].to_pydatetime(), float(b.close.iloc[-1])
 
-    def rth_low(self, sym: str, day: date, now: datetime) -> float | None:
-        bars = self._bars(sym, "M1", 400)
+    def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None:
+        """返回新收盘的分钟线中最后一根的结束时刻、收盘价和这段的最高价。"""
+        minute = timedelta(minutes=1)
+        count = 3 if since is None else min(1200, max(3, math.ceil((now - since) / minute) + 1))
+        bars = self._bars(sym, "M1", count)
         if bars.empty:
             return None
-        completed = (bars.index + pd.Timedelta(minutes=1) <= now) & (bars.index.date == day)
-        regular = bars.loc[completed & (bars.session == "RTH"), "low"]
-        return float(regular.min()) if not regular.empty else None
+        # A full session can exceed the Webull page limit after a late start.
+        if since is not None and len(bars) == 1200 and bars.index[0] > since:
+            end_time = int((bars.index[0] - timedelta(seconds=1)).timestamp() * 1000)
+            remaining = max(3, math.ceil((bars.index[0] - since) / minute) + 1)
+            earlier = self._bars(sym, "M1", min(1200, remaining), end_time=end_time)
+            if not earlier.empty:
+                bars = pd.concat([earlier.loc[earlier.index < bars.index[0]], bars])
+        bars = bars.loc[bars.index + minute <= now]
+        bars = bars.iloc[-1:] if since is None else bars.loc[bars.index >= since]
+        if bars.empty:
+            return None
+        return (bars.index[-1].to_pydatetime() + minute, float(bars.close.iloc[-1]), float(bars.high.max()))
 
     def prev_rth_close(self, sym: str, day: date) -> float:
         b = self._bars(sym, "M5", 600)
@@ -182,39 +321,7 @@ class WebullMarket:
         return float(w.low.min()), float(w.high.max()), vwap
 
     def kospi_move(self, now: datetime) -> float | None:
-        """KOSPI 当天涨跌（相对上一交易日收盘），用 Yahoo 5 分钟线，只取已收盘的 K 线。"""
-        import requests
-        from .intraday_data import KOSPI_URL
-        r = requests.get(KOSPI_URL, params={"interval": "5m", "range": "5d"},
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        j = r.json()["chart"]["result"][0]
-        ts = pd.to_datetime(j["timestamp"], unit="s", utc=True) + pd.Timedelta(minutes=5)
-        df = pd.DataFrame({"close": j["indicators"]["quote"][0]["close"]}, index=ts).dropna()
-        df = df[df.index <= pd.Timestamp(now).tz_convert("UTC")]
-        if df.empty:
-            return None
-        kday = (df.index.tz_convert("Asia/Seoul") - pd.Timedelta(minutes=5)).date
-        last_day = kday[-1]
-        today_kst = pd.Timestamp(now).tz_convert("Asia/Seoul").date()
-        if last_day != today_kst:
-            return None                      # 今天韩国休市或还没开盘：不拿昨天的数据冒充
-        # 昨收用日线的官方收盘价：5 分钟线最后一根不含 15:20-15:30 的收盘集合竞价，可能差很多
-        #（2026-11-06 最后一根 5 分钟线 ≈5100，官方收盘 5059.69，当天涨跌被低估 0.8 个点）
-        # 收盘以后，当天的值也用日线的官方收盘价（同样是集合竞价的问题）
-        daily = _kospi_daily_closes()
-        prevs = [c for d, c in daily if d < last_day]
-        prev_close = prevs[-1] if prevs else None
-        if prev_close is None:
-            prev = df[kday < last_day]
-            if prev.empty:
-                return None
-            prev_close = float(prev.close.iloc[-1])
-        cur = float(df.close.iloc[-1])
-        if pd.Timestamp(now).tz_convert("Asia/Seoul").time() >= KOSPI_CLOSE_KST:
-            today = [c for d, c in daily if d == last_day]
-            if today:
-                cur = today[-1]
-        return float(cur / prev_close - 1)
+        return fetch_kospi_move(now)
 
     def daily(self, sym: str, count: int) -> pd.DataFrame:
         from .webull_client import _json, _unwrap_list, bars_to_frame
@@ -225,29 +332,92 @@ class WebullMarket:
             df = df[df.index.date < now.date()]
         return df
 
+    def macro_short_allowed(self, day: date, gate_cfg: dict) -> tuple[bool, str]:
+        return eval_macro_short_gate(day, gate_cfg)
+
+
+class CachedMarket:
+    """短时行情缓存包装器：让多套并行模拟盘在同一轮询内共享 Webull/Yahoo 行情，避免重复请求。"""
+
+    def __init__(self, inner: Market, quote_ttl: float = 15.0, slow_ttl: float = 300.0):
+        self.inner = inner
+        self.quote_ttl = quote_ttl
+        self.slow_ttl = slow_ttl
+        self._cache: dict[tuple, tuple[float, object]] = {}
+
+    def _get(self, key: tuple, ttl: float, fn):
+        now_t = _time.monotonic()
+        hit = self._cache.get(key)
+        if hit is not None and now_t - hit[0] <= ttl:
+            return hit[1]
+        val = fn()
+        self._cache[key] = (now_t, val)
+        return val
+
+    def last_price(self, sym: str) -> tuple[datetime, float]:
+        return self._get(("last", sym), self.quote_ttl, lambda: self.inner.last_price(sym))
+
+    def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None:
+        key = ("mq", sym, since.isoformat() if since else None, now.replace(second=0, microsecond=0).isoformat())
+        return self._get(key, self.quote_ttl, lambda: self.inner.minute_quote(sym, since, now))
+
+    def prev_rth_close(self, sym: str, day: date) -> float:
+        return self._get(("prev", sym, day), self.slow_ttl, lambda: self.inner.prev_rth_close(sym, day))
+
+    def daily(self, sym: str, count: int) -> pd.DataFrame:
+        return self._get(("daily", sym, count), self.slow_ttl, lambda: self.inner.daily(sym, count))
+
+    def kospi_move(self, now: datetime) -> float | None:
+        key = ("kospi", now.replace(second=0, microsecond=0).isoformat())
+        return self._get(key, self.quote_ttl, lambda: self.inner.kospi_move(now))
+
+    def path_stats(self, sym: str, day: date) -> tuple[float, float, float | None]:
+        return self._get(("path", sym, day), self.quote_ttl, lambda: self.inner.path_stats(sym, day))
+
+    def macro_short_allowed(self, day: date, gate_cfg: dict) -> tuple[bool, str]:
+        syms = tuple((gate_cfg or {}).get("symbols") or ())
+        win = int((gate_cfg or {}).get("sma_window") or 60)
+        key = ("macro", day, bool((gate_cfg or {}).get("enabled")), syms, win)
+        return self._get(key, self.slow_ttl, lambda: eval_macro_short_gate(day, gate_cfg)
+                         if not hasattr(self.inner, "macro_short_allowed")
+                         else self.inner.macro_short_allowed(day, gate_cfg))
+
 
 # ---------------------------------------------------------------- 下单
-def _submit(broker, sym: str, side: str, qty: int, price: float, reason: str) -> bool:
+def _submit(broker, sym: str, side: str, qty: int, price: float, reason: str, *, stop_price=None) -> bool:
     if qty <= 0:
         return False
     intent = OrderIntent(sym, side, qty, price, reason)
     try:
         res = broker.submit(intent)
     except Exception as e:
-        journal.record("swing_order", symbol=sym, side=side, qty=qty, price=price, reason=reason, error=str(e))
+        res = getattr(e, "order_attempt", {"status": "error"})
         print(f"  下单失败: {e}")
-        return False
+        error = str(e)
+    else:
+        error = None
+    from .wechat import record_order
+
+    try:
+        record_order(broker, intent, res, stop_price=stop_price)
+    except Exception as exc:
+        print(f"  微信通知写入失败（{type(exc).__name__}），交易按原订单结果处理")
     ok = res.get("status") not in ("error", "rejected")
     journal.record("swing_order", symbol=sym, side=side, qty=qty, price=price, reason=reason,
-                   status=res.get("status"), order=res.get("order"))
+                   status=res.get("status"), order=res.get("order"), stop_price=stop_price, error=error)
     return ok
 
 
-def make_broker(settings: Settings, mode: str, confirm_live: bool, order_cfg: dict):
-    from .broker import DryRunBroker, WebullBroker
+def make_broker(settings: Settings, mode: str, confirm_live: bool, order_cfg: dict, *, label: str = "paper"):
+    from .broker import DryRunBroker, LocalSimBroker, WebullBroker
     if mode == "webull":
         from .webull_client import WebullClient
         return WebullBroker(settings, WebullClient(settings), order_cfg, confirm_live=confirm_live)
+    if mode == "paper":
+        return LocalSimBroker(order_cfg, label=label)
+    if mode == "futu-sim":
+        from .futu_gateway import FutuSimBroker
+        return FutuSimBroker(order_cfg, label=label)
     return DryRunBroker(order_cfg)
 
 
@@ -304,6 +474,7 @@ class TacState:
     stopped: bool = False
     low_after_stop: float | None = None
     reentries: int = 0
+    reentry_checked_at: str = ""
     scan_note: str = ""                             # 连续扫描上一次的结论（只在变化时写日志）
     done: bool = False
     pnl: float = 0.0
@@ -312,15 +483,20 @@ class TacState:
     trend_regime: int | None = None                 # +1 上涨 / 0 震荡 / -1 下跌
     trend_note: str = ""
     core_active_today: bool = False                 # 今天是否由核心层接管
-    core_day_low: float | None = None
+    core_prev_close: float | None = None
+    macro_short_allowed: bool | None = None         # 宏观利率门控结果（True 允许夜盘做空 SOXS / False 禁止）
+    macro_short_note: str = ""
     log: list = field(default_factory=list)
 
 
 @dataclass
 class CoreState:
-    """跨日持久化的核心层状态（用于三票制双层切换及成本止损）。"""
+    """持仓可以跨日，高点只在对应的美股交易日内有效。"""
     holding: bool = False
     entry: float = 0.0
+    peak: float = 0.0
+    peak_day: str = ""
+    peak_checked_at: str = ""
     stopped: bool = False
     stopped_day: str = ""
     last_votes: int | None = None
@@ -510,11 +686,12 @@ def path_signal(move: float, px: float, lo: float, hi: float, vwap: float | None
     return side, desc, False
 
 
-def eval_trend_switch(settings: Settings, md: Market) -> tuple[int, int, str]:
+def eval_trend_switch(settings: Settings, md: Market, day: date) -> tuple[int, int, str]:
     """用 1 倍指数（SOXX）日线计算三票制总分（-3~+3）和趋势状态（+1 上涨 / 0 震荡 / -1 下跌）。"""
     ts = swing_cfg(settings)["tactical"].get("trend_switch") or {}
     idx_sym = ts.get("index", "SOXX")
     daily = md.daily(idx_sym, 120)
+    daily = daily.loc[daily.index.date < day]
     votes = int(ensemble_votes(daily).iloc[-1])
     reg = trend_regime(votes)
     idx_date = str(daily.index[-1].date()) if len(daily) else ""
@@ -531,6 +708,14 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
     day = date.fromisoformat(st.day)
     if st.done:
         return st
+    window = market_window(day)
+    if window is None or now >= window[2]:
+        st.done = True
+        return st
+    session_start, regular_close, session_end = window
+    if now < session_start:
+        return st
+    tactical_exit = min(_at(day, t["exit"]), regular_close - timedelta(minutes=5))
 
     def note(msg):
         stamp = now.astimezone(ET).strftime("%m-%d %H:%M")
@@ -546,13 +731,14 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         limit = round(px * (1 + offset), 2)
         return math.floor(budget / limit) if limit > 0 else 0
 
-    def enter(sym, px, why):
+    def enter(sym, px, why, *, position_frac: float | None = None) -> bool:
         eq = system_equity(settings)
-        f = min(st.frac or t["position_frac"], t["max_frac_ovn"] if in_ovn() else t["max_frac"])
+        target = position_frac if position_frac is not None else st.frac or t["position_frac"]
+        f = min(target, t["max_frac_ovn"] if in_ovn() else t["max_frac"])
         qty = affordable_shares(eq * f, px)
         if qty < 1:
             note(f"本金 ${eq:,.0f} 太少，买不起 1 股 {sym}")
-            return
+            return False
         if _submit(broker, sym, "BUY", qty, px, why):
             if not dry:
                 books.add("tactical", sym, qty)
@@ -560,6 +746,8 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             st.frac_total, st.last_add, st.adds, st.peak = qty * px / eq, px, 0, px
             st.trades += 1
             note(f"买入 {sym} {qty} 股 @ {px:.2f}，约 ${qty * px:,.0f}（{st.frac_total:.0%}，{why}）")
+            return True
+        return False
 
     def add(px):
         eq = system_equity(settings)
@@ -576,8 +764,8 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             st.last_add, st.adds = px, st.adds + 1
             note(f"加仓 {st.symbol} {q} 股 @ {px:.2f}，总仓位 {st.qty} 股 / {st.frac_total:.0%}，均价 {st.entry:.2f}")
 
-    def exit_(px, why):
-        if _submit(broker, st.symbol, "SELL", st.qty, px, why):
+    def exit_(px, why, *, stop_price=None):
+        if _submit(broker, st.symbol, "SELL", st.qty, px, why, stop_price=stop_price):
             if not dry:
                 books.add("tactical", st.symbol, -st.qty)
             pnl = (px - st.entry) * st.qty
@@ -597,14 +785,15 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             if not dry:
                 books.add("core", core_sym, qty)
             cst.holding, cst.entry = True, px
+            cst.peak, cst.peak_day, cst.peak_checked_at = 0.0, "", ""
             cst.stopped, cst.stopped_day = False, ""
             _save_core_state(settings.environment, cst)
             note(f"[核心层] 买入 {core_sym} {qty} 股 @ {px:.2f}，约 ${qty * px:,.0f}（{qty * px / eq:.0%}，{why}）")
             return True
         return False
 
-    def core_sell(cst: CoreState, core_sym: str, qty: int, px: float, why: str, mark_stopped: bool) -> bool:
-        if _submit(broker, core_sym, "SELL", qty, px, why):
+    def core_sell(cst: CoreState, core_sym: str, qty: int, px: float, why: str, *, stop_price=None) -> bool:
+        if _submit(broker, core_sym, "SELL", qty, px, why, stop_price=stop_price):
             if not dry:
                 books.add("core", core_sym, -qty)
             basis = cst.entry or px
@@ -612,7 +801,8 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             st.pnl += pnl
             _add_pnl(settings, pnl, st.day)
             cst.holding, cst.entry = False, 0.0
-            if mark_stopped:
+            cst.peak, cst.peak_day, cst.peak_checked_at = 0.0, "", ""
+            if stop_price is not None:
                 cst.stopped, cst.stopped_day = True, str(day)
             else:
                 cst.stopped, cst.stopped_day = False, ""
@@ -630,7 +820,7 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         core_sym = ts_cfg.get("core_symbol", t["long"])
         core_start = _at(day, ts_cfg.get("core_session_start", "09:30"))
         if st.trend_regime is None:
-            st.trend_votes, st.trend_regime, st.trend_note = eval_trend_switch(settings, md)
+            st.trend_votes, st.trend_regime, st.trend_note = eval_trend_switch(settings, md, day)
             cst.last_votes, cst.last_regime = st.trend_votes, st.trend_regime
             _save_core_state(settings.environment, cst)
             note(st.trend_note)
@@ -639,67 +829,86 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         # 非上涨趋势：先清空遗留核心仓，再让战术层按方向门禁运行
         if st.trend_regime != 1:
             if core_qty > 0:
-                _, cpx = md.last_price(core_sym)
-                if not core_sell(cst, core_sym, core_qty, cpx, f"趋势转弱（三票 {st.trend_votes:+d}），平掉核心仓", mark_stopped=False):
+                quote = md.minute_quote(core_sym, None, now)
+                if quote is None or quote[0] <= session_start or now - quote[0] > timedelta(minutes=2):
+                    return st
+                _, cpx, _ = quote
+                if not core_sell(cst, core_sym, core_qty, cpx, f"趋势转弱（三票 {st.trend_votes:+d}），平掉核心仓"):
                     return st
             elif cst.stopped:
                 cst.stopped, cst.stopped_day = False, ""
                 _save_core_state(settings.environment, cst)
         else:
             # 上涨趋势：
-            # A) 已持有核心仓，或未处于止损冷却 → 今天由核心层全权接管（盘中 09:30 起建仓并按成本止损，收盘保留过夜）
+            # A) 核心仓接管当天，使用前一晚夜盘开始后的日内最高价。
             if core_qty > 0 or not cst.stopped:
                 st.core_active_today = True
                 st.decided = True
-                if now >= _at(day, t["exit"]):
-                    note(f"[核心层] 收盘保留 {core_sym} {core_qty} 股过夜，系统权益 ${system_equity(settings):,.0f}")
-                    st.done = True
+                if core_qty > 0:
+                    if cst.entry <= 0:
+                        raise RuntimeError("核心持仓缺少入场均价，请核对本地账本与券商成交")
+                    if cst.peak_day != st.day:
+                        cst.peak, cst.peak_day, cst.peak_checked_at = 0.0, st.day, ""
+                    since = datetime.fromisoformat(cst.peak_checked_at) if cst.peak_checked_at else session_start
+                    quote = md.minute_quote(core_sym, since, now)
+                    if quote is not None:
+                        observed_at, cpx, high = quote
+                        cst.peak = max(cst.peak, high)
+                        stop_pct = float(ts_cfg["trail_pct"])
+                        stop = cst.peak * (1 - stop_pct)
+                        if now - observed_at <= timedelta(minutes=2) and cpx <= stop:
+                            # Preserve the quote cursor on a failed submission so the same bar can be retried.
+                            why = f"核心移动止损（日内最高 {cst.peak:.2f} 回撤 {stop_pct:.0%}，止损线 {stop:.2f}）"
+                            st.done = core_sell(cst, core_sym, core_qty, cpx, why, stop_price=stop)
+                            if not st.done:
+                                _save_core_state(settings.environment, cst)
+                            return st
+                        cst.peak_checked_at = observed_at.isoformat()
+                        _save_core_state(settings.environment, cst)
                     return st
-                if core_qty == 0:
-                    if now < core_start:
-                        return st
+                if now >= tactical_exit:
+                    st.done = True
+                elif now >= core_start:
                     if KILL_SWITCH.exists():
                         note("KILL_SWITCH 存在，核心层今天不开仓")
                         st.done = True
                         return st
                     _, cpx = md.last_price(core_sym)
                     core_buy(cst, core_sym, cpx, f"三票上涨趋势（{st.trend_votes:+d} 票）建核心仓")
-                    return st
-                if cst.entry <= 0:
-                    raise RuntimeError("核心持仓缺少入场均价，请核对本地账本与券商成交")
-                _, cpx = md.last_price(core_sym)
-                stop_p = float(ts_cfg["stop_pct"])
-                if cpx <= cst.entry * (1 - stop_p):
-                    st.done = core_sell(cst, core_sym, core_qty, cpx,
-                                        f"核心成本止损（均价 {cst.entry:.2f}，现价 {cpx:.2f}）", mark_stopped=True)
                 return st
 
-            # B) 上涨趋势但核心层已止损空仓（cst.stopped == True）：
-            #    - 09:30 前允许战术层顺势只做多（禁空）；
-            #    - 09:30 起若今天战术层没开仓，则从次日起实时盯盘中反弹 >= rebuy_pct 买回核心仓
-            if now >= core_start and st.qty == 0 and st.trades == 0:
-                if now >= _at(day, t["exit"]):
-                    note(f"[核心层] 止损等待期未触发反弹买回，今天结束，系统权益 ${system_equity(settings):,.0f}")
-                    st.done = True
-                    return st
+            # B) 止损次日起，在配置时段检查核心买回。夜盘内仍允许顺势战术信号。
+            if st.qty == 0 and st.trades == 0:
                 if str(day) <= cst.stopped_day:
                     st.done = True
                     return st
-                _, cpx = md.last_price(core_sym)
-                low = md.rth_low(core_sym, day, now)
-                if low is None:
+                rth_rebuy = ts_cfg.get("rebuy_session") == "RTH"
+                rebuy_start = core_start if rth_rebuy else session_start
+                rebuy_end = tactical_exit if rth_rebuy else session_end
+                if now >= rebuy_end:
+                    st.done = True
                     return st
-                st.core_day_low = min(st.core_day_low or low, low, cpx)
-                reb = float(ts_cfg.get("rebuy_pct", 0.05))
-                if cpx >= st.core_day_low * (1 + reb):
-                    if KILL_SWITCH.exists():
-                        note("KILL_SWITCH 存在，核心层不买回")
-                        st.done = True
+                if now >= rebuy_start:
+                    if st.core_prev_close is None:
+                        st.core_prev_close = md.prev_rth_close(core_sym, day)
+                    since = max(rebuy_start, now.replace(second=0, microsecond=0) - timedelta(minutes=3))
+                    quote = md.minute_quote(core_sym, since, now)
+                    reb = float(ts_cfg.get("rebuy_pct", 0.05))
+                else:
+                    quote = None
+                if quote is not None:
+                    observed_at, cpx, _ = quote
+                    if now - observed_at <= timedelta(minutes=2) and cpx >= st.core_prev_close * (1 + reb):
+                        if KILL_SWITCH.exists():
+                            note("KILL_SWITCH 存在，核心层不买回")
+                            st.done = True
+                            return st
+                        if core_buy(cst, core_sym, cpx, f"较上一交易日常规盘收盘 {st.core_prev_close:.2f} 上涨 {reb:.0%} 买回"):
+                            st.core_active_today = True
+                            st.decided = True
                         return st
-                    if core_buy(cst, core_sym, cpx, f"从当日常规盘低点 {st.core_day_low:.2f} 反弹 {reb:.0%} 买回"):
-                        st.core_active_today = True
-                        st.decided = True
-                return st
+                if st.decided or now >= tactical_exit:
+                    return st
 
     # 1) 还没进场：在各个检查时点判断
     if not st.decided:
@@ -709,6 +918,13 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             return st
         pc = t.get("path") or {}
         lo_t, hi_t = _scan_window(t, day)
+        if _continuous(t) and now > hi_t:
+            wait_core_rebuy = dual and st.trend_regime == 1 and cst.stopped and str(day) > cst.stopped_day
+            note("已过夜盘扫描窗口，盘前结束转盯核心反弹买回" if wait_core_rebuy else "已过夜盘扫描窗口，今天不做")
+            st.decided = True
+            if not wait_core_rebuy:
+                st.done = True
+            return st
         due = [c for c in t["checkpoints"] if now >= _at(day, c) and c not in st.evaluated]
         scanning = _continuous(t) and lo_t <= now <= hi_t
         if not due and not scanning:
@@ -721,6 +937,21 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
             st.decided = st.done = True
             return st
         allowed, direction_note = tactical_directions(t, st.trend_regime if dual else None)
+        macro_cfg = t.get("macro_short_gate") or {}
+        if macro_cfg.get("enabled"):
+            if st.macro_short_allowed is None:
+                if hasattr(md, "macro_short_allowed"):
+                    st.macro_short_allowed, st.macro_short_note = md.macro_short_allowed(day, macro_cfg)
+                else:
+                    st.macro_short_allowed, st.macro_short_note = eval_macro_short_gate(day, macro_cfg)
+                if st.macro_short_note:
+                    note(st.macro_short_note)
+            if not st.macro_short_allowed:
+                allowed = allowed - {"short"}
+                if not allowed:
+                    direction_note = "三票仅允许做空，但利率门控禁做空 SOXS"
+                else:
+                    direction_note = f"{direction_note}（利率门控禁做空 SOXS）"
         if st.gate != direction_note:
             st.gate = direction_note
             note(direction_note)
@@ -776,37 +1007,57 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         _, spx = md.last_price(sym)
         enter(sym, spx, why)
         if not st.qty:
-            st.done = True
+            st.done = not (dual and st.trend_regime == 1 and cst.stopped and st.day > cst.stopped_day)
         return st
 
     sym = st.symbol or (t["long"] if st.side > 0 else t["short"])
-    _, px = md.last_price(sym)
 
     # 2) 收盘前平仓
-    if now >= _at(day, t["exit"]):
+    if now >= tactical_exit:
         if st.qty:
+            _, px = md.last_price(sym)
             exit_(px, "收盘前平仓")
         st.done = True
         note(f"今天结束，战术层 ${st.pnl:+,.0f}，系统权益 ${system_equity(settings):,.0f}")
         return st
 
-    # 3) 持仓：止损 / 加仓后回撤止盈 / 盈利加仓
+    # 3) 第二腿按本次买回后的最高价计算移动止损。
+    reentry_trail = t.get("reentry_trail_pct")
+    if st.qty and st.reentries and reentry_trail:
+        since = datetime.fromisoformat(st.reentry_checked_at) if st.reentry_checked_at else None
+        quote = md.minute_quote(sym, since, now)
+        if quote is not None:
+            observed_at, px, high = quote
+            st.peak = max(st.peak, st.entry, high)
+            stop = st.peak * (1 - reentry_trail)
+            if now - observed_at <= timedelta(minutes=2) and px <= stop:
+                exit_(px, f"第 2 腿移动止损：从买回后最高 {st.peak:.2f} 回撤 {reentry_trail:.0%}", stop_price=stop)
+                if not st.qty:
+                    st.stopped, st.low_after_stop = True, px
+            else:
+                st.reentry_checked_at = observed_at.isoformat()
+        return st
+
+    _, px = md.last_price(sym)
     if st.qty:
         st.peak = max(st.peak or px, px)
         rstop = t.get("reentry_stop_pct")
         if st.reentries >= 1 and rstop is not None:
-            if rstop > 0 and px <= st.entry * (1 - rstop):
-                exit_(px, f"第 2 腿兜底止损：跌破均价 {rstop:.0%}")
+            stop = st.entry * (1 - rstop)
+            if rstop > 0 and px <= stop:
+                exit_(px, f"第 2 腿兜底止损：跌破均价 {rstop:.0%}", stop_price=stop)
                 st.stopped, st.low_after_stop = True, px
             return st
         if px <= st.entry * (1 - t["stop_pct"]):
-            exit_(px, f"止损：跌破均价 {t['stop_pct']:.0%}")
+            exit_(px, f"止损：跌破均价 {t['stop_pct']:.0%}", stop_price=st.entry * (1 - t["stop_pct"]))
             st.stopped, st.low_after_stop = True, px
         elif st.adds and t.get("trail_after_add") and px <= st.peak * (1 - t["trail_after_add"]):
-            exit_(px, f"加仓后从最高 {st.peak:.2f} 回撤 {t['trail_after_add']:.0%} 止盈")
+            exit_(px, f"加仓后从最高 {st.peak:.2f} 回撤 {t['trail_after_add']:.0%} 止盈",
+                  stop_price=st.peak * (1 - t["trail_after_add"]))
             st.stopped, st.low_after_stop = True, px
         elif t.get("trail_pct") and px <= st.peak * (1 - t["trail_pct"]):
-            exit_(px, f"移动止损：从持仓最高 {st.peak:.2f} 回撤 {t['trail_pct']:.0%}")
+            exit_(px, f"移动止损：从持仓最高 {st.peak:.2f} 回撤 {t['trail_pct']:.0%}",
+                  stop_price=st.peak * (1 - t["trail_pct"]))
             st.stopped, st.low_after_stop = True, px
         elif (t.get("add_step") and not in_ovn() and _at(day, t["add_from"]) <= now < _at(day, t["add_last"])
               and st.frac_total < t["max_frac"] - 1e-6 and px >= st.last_add * (1 + t["add_step"])):
@@ -818,30 +1069,47 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
     if st.stopped and t["reentry"] and (limit is None or st.reentries < limit):
         st.low_after_stop = min(st.low_after_stop or px, px)
         if now < _at(day, t["last_reentry"]) and px >= st.low_after_stop * (1 + t["rebound_pct"]):
-            st.reentries += 1
-            enter(sym, px, f"卖出后从低点 {st.low_after_stop:.2f} 反弹 {t['rebound_pct']:.0%} 买回（今天第 {st.reentries} 次）")
+            why = f"卖出后从低点 {st.low_after_stop:.2f} 反弹 {t['rebound_pct']:.0%} 买回（今天第 {st.reentries + 1} 次）"
+            if enter(sym, px, why, position_frac=t.get("reentry_position_frac")):
+                st.reentries += 1
+                # The entry minute can include a high reached before this buy.
+                st.reentry_checked_at = (now.replace(second=0, microsecond=0) + timedelta(minutes=1)).isoformat()
     return st
 
 
 def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_fn: Callable[[], datetime],
                      sleep_fn: Callable[[float], None] = _time.sleep, dry: bool = False,
                      day: date | None = None) -> TacState:
-    """守护进程：从现在一直运行到当天收盘前平仓。中途重启会从状态文件接着跑。"""
+    """运行一个交易日。战术仓尾盘退出，核心仓继续监控到盘后关闭。"""
     t = swing_cfg(settings)["tactical"]
     ts_cfg = t.get("trend_switch") or {}
     day = day or trading_day(now_fn())
     st = _load_state(settings.environment, day)
+    window = market_window(day)
+    if window is None:
+        st.done = True
+        return st
+    session_start, regular_close, session_end = window
+    now = now_fn()
+    if now < session_start or now >= session_end:
+        return st
+    if st.done and ts_cfg.get("enabled"):
+        cst = _load_core_state(settings.environment)
+        waiting_to_rebuy = st.trend_regime == 1 and st.trades == 0 and cst.stopped and st.day > cst.stopped_day
+        if books.qty("core", ts_cfg.get("core_symbol", t["long"])) or waiting_to_rebuy:
+            st.done = False
     if st.done:
         print(f"[战术层] {day} 已经跑完：{st.log[-1] if st.log else ''}")
         return st
     if ts_cfg.get("enabled"):
         print(f"[双层模式] 启用三票制动态切换（{ts_cfg.get('index', 'SOXX')}）："
-              f"上涨持 {ts_cfg.get('core_symbol', 'SOXL')}（成本止损 {ts_cfg['stop_pct']:.0%} / 次日起由当日低点反弹 {ts_cfg.get('rebuy_pct', 0.05):.0%} 买回），"
+              f"上涨持 {ts_cfg.get('core_symbol', 'SOXL')}（最高价回撤止损 {ts_cfg['trail_pct']:.0%} / 次日起较上一常规盘收盘价上涨 {ts_cfg.get('rebuy_pct', 0.05):.0%} 买回），"
               f"非上涨切战术层")
     if _continuous(t):
         lo_t, hi_t = _scan_window(t, day)
         print(f"[战术层] 连续扫描 {lo_t:%H:%M}–{hi_t:%H:%M} ET（每 {t['poll_seconds']} 秒），看昨收以来的高低点 / VWAP")
-    print(f"[战术层] 交易日 {day}：检查时点 {', '.join(t['checkpoints'])} ET，{t['exit']} ET 平仓；"
+    flat = min(_at(day, t["exit"]), regular_close - timedelta(minutes=5))
+    print(f"[战术层] 交易日 {day}：检查时点 {', '.join(t['checkpoints'])} ET，{flat:%H:%M} ET 平仓；"
           f"系统权益 ${system_equity(settings):,.0f}，每笔 {t['position_frac']:.0%}")
     while not st.done:
         now = now_fn()
@@ -854,11 +1122,12 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
         if st.done:
             break
         core_start = _at(day, ts_cfg.get("core_session_start", "09:30"))
-        if (ts_cfg.get("enabled") and st.trend_regime == 1 and st.decided and st.qty == 0
-                and st.trades == 0 and now < core_start
-                and not books.qty("core", ts_cfg.get("core_symbol", t["long"]))):
+        core_flat = (ts_cfg.get("enabled") and st.trend_regime == 1 and st.qty == 0
+                     and st.trades == 0 and not books.qty("core", ts_cfg.get("core_symbol", t["long"])))
+        waiting_to_rebuy = core_flat and _load_core_state(settings.environment).stopped
+        if core_flat and st.decided and now < core_start and not waiting_to_rebuy:
             sleep_fn(max(1.0, (core_start - now_fn()).total_seconds()))
-        elif not st.decided:
+        elif not st.decided and not waiting_to_rebuy:
             pending = [_at(day, c) for c in t["checkpoints"] if c not in st.evaluated]
             nxt = min(pending) if pending else now + timedelta(seconds=t["poll_seconds"])
             if _continuous(t):                     # 扫描窗口内每 poll_seconds 看一次
@@ -867,15 +1136,46 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
                     nxt = min(nxt, max(lo_t, now + timedelta(seconds=t["poll_seconds"])))
             sleep_fn(max(1.0, (nxt - now_fn()).total_seconds()))
         else:
-            sleep_fn(t["poll_seconds"])
+            sleep_fn(max(0.0, min(t["poll_seconds"], (session_end - now_fn()).total_seconds())))
     journal.record("swing_tactical", **{k: v for k, v in asdict(st).items() if k != "log"}, log=st.log)
     return st
 
 
-def trading_day(now: datetime) -> date:
-    """战术层对应的美股交易日：美东 16:00 以后算下一个交易日（夜盘属于下一天）。"""
-    d = now.astimezone(ET)
-    day = d.date() + (timedelta(days=1) if d.time() >= time(16, 0) else timedelta(0))
-    while day.weekday() >= 5:
+def market_window(day: date) -> tuple[datetime, datetime, datetime] | None:
+    """返回美东夜盘开盘、常规收盘、盘后收盘。"""
+    from .scalp_data import session_bounds
+
+    regular = session_bounds(day)
+    if regular is None:
+        return None
+    regular_close = regular[1].to_pydatetime()
+    return _at(day, "20:00"), regular_close, regular_close + timedelta(hours=4)
+
+
+def next_market_window(now: datetime) -> tuple[date, datetime, datetime]:
+    """当前或下一个交易日的连续交易窗口，跳过休市。"""
+    day = now.astimezone(ET).date()
+    while True:
+        window = market_window(day)
+        if window is not None and now < window[2]:
+            return day, window[0], window[2]
         day += timedelta(days=1)
-    return day
+
+
+def run_tactical_watch(settings: Settings, md: Market, broker, books: Books,
+                       now_fn: Callable[[], datetime], sleep_fn: Callable[[float], None] = _time.sleep) -> None:
+    """在每个交易窗口运行策略，闭市时等待下一场夜盘。"""
+    while True:
+        now = now_fn()
+        day, opens, closes = next_market_window(now)
+        if now < opens:
+            sleep_fn(opens.timestamp() - now.timestamp())
+            continue
+        run_tactical_day(settings, md, broker, books, now_fn, sleep_fn=sleep_fn, day=day)
+        remaining = closes.timestamp() - now_fn().timestamp()
+        if remaining > 0:
+            sleep_fn(remaining)
+
+
+def trading_day(now: datetime) -> date:
+    return next_market_window(now)[0]

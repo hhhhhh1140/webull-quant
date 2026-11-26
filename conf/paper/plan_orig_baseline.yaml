@@ -1,0 +1,19 @@
+# 模拟盘原版：2026 年 1150%/919% 基准策略（本地实时模拟盘）
+# 无宏观利率门控，21:00-04:00 连续扫描，允许第 2 腿满仓买回（6% 固定止损）。
+swing:
+  tactical:
+    checkpoints: ["21:00", "23:00", "01:30", "04:00"]
+    reentry: true
+    max_reentries: 1
+    reentry_position_frac: 1.0
+    reentry_stop_pct: 0.06
+    macro_short_gate:
+      enabled: false
+      symbols: ["^IRX", "^TNX"]
+      sma_window: 60
+    path:
+      enabled: true
+      scan: continuous
+      scan_from: "21:00"
+      scan_to: "04:00"
+      veto_pct: 0.06

@@ -1,0 +1,20 @@
+# 模拟盘方案 B：防收割满仓版（富途美股模拟盘 futu-sim / 本地模拟）
+# 三重防反抽收割：
+# 1) ^IRX 且 ^TNX > SMA60 才允许夜盘做空 SOXS
+# 2) 仅 21:00-23:59 扫描（停掉 00:00 后深夜追单）
+# 3) 取消第 2 腿买回（方向做反止损后不再二次满仓挨耳光）
+swing:
+  tactical:
+    checkpoints: ["21:00", "23:00"]
+    reentry: false
+    max_reentries: 0
+    macro_short_gate:
+      enabled: true
+      symbols: ["^IRX", "^TNX"]
+      sma_window: 60
+    path:
+      enabled: true
+      scan: continuous
+      scan_from: "21:00"
+      scan_to: "23:59"
+      veto_pct: 0.06

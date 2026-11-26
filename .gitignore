@@ -1,6 +1,8 @@
 .venv/
 .env
-conf/
+conf/*
+!conf/paper/
+!conf/paper/*.yaml
 state/
 logs/
 data/cache/

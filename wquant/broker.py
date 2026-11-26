@@ -65,6 +65,22 @@ class DryRunBroker:
         return {"status": "dry_run", "order": order}
 
 
+class LocalSimBroker:
+    """本地实时模拟盘执行器：使用真实实时行情与限价偏移记账，状态由策略独立账本维护。"""
+    name = "local-paper"
+
+    def __init__(self, order_cfg: dict, label: str = "paper"):
+        self.order_cfg = order_cfg
+        self.label = label
+
+    def submit(self, intent: OrderIntent) -> dict:
+        order = build_webull_order(intent, self.order_cfg)
+        fill_price = float(order.get("limit_price") or intent.price)
+        print(f"  [LOCAL PAPER:{self.label}] {intent.side} {intent.symbol} {intent.quantity} 股 "
+              f"@ ref {intent.price:.2f} (limit {fill_price:.2f}, {order['support_trading_session']})")
+        return {"status": "filled", "order": order, "price": fill_price, "quantity": int(intent.quantity)}
+
+
 class PaperBroker:
     """本地模拟账户，状态存在 state/paper_account.json。"""
     name = "paper"
@@ -129,8 +145,14 @@ class WebullBroker:
 
     def submit(self, intent: OrderIntent) -> dict:
         order = build_webull_order(intent, self.order_cfg)
-        preview = self.client.preview_order(order)
-        print(f"  [{self.settings.environment.upper()}] preview: {json.dumps(preview, ensure_ascii=False, default=str)[:300]}")
-        result = self.client.place_order(order)
+        attempting = False
+        try:
+            preview = self.client.preview_order(order)
+            print(f"  [{self.settings.environment.upper()}] preview: {json.dumps(preview, ensure_ascii=False, default=str)[:300]}")
+            attempting = True
+            result = self.client.place_order(order)
+        except Exception as exc:
+            exc.order_attempt = {"status": "error", "order": order, "attempted": attempting}
+            raise
         print(f"  [{self.settings.environment.upper()}] placed: {json.dumps(result, ensure_ascii=False, default=str)[:300]}")
         return {"status": "submitted", "order": order, "preview": preview, "result": result}

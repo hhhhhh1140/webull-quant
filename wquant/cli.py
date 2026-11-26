@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal
 
 from .config import load_settings
 
@@ -94,6 +95,141 @@ def cmd_run(args, s):
     """Run the semiconductor core and tactical layers using the same entry point as swing tactical."""
     args.what = "tactical"
     return cmd_swing(args, s)
+
+
+def cmd_futu_check(args, s):
+    from .futu_gateway import check_accounts
+
+    return check_accounts()
+
+
+def cmd_wechat(args, s):
+    from getpass import getpass
+
+    from . import clawbot, wechat
+
+    if args.action == "watch":
+        wechat.watch(args.config)
+        return 0
+    if args.action == "chat-login":
+        try:
+            clawbot.pairing()
+        except (OSError, ValueError, KeyError, clawbot.ClawError) as exc:
+            error = str(exc) if isinstance(exc, clawbot.ClawError) else type(exc).__name__
+            print(f"微信绑定未完成（{error}）")
+            return 1
+        return 0
+    if args.action == "chat-status":
+        from . import gemini_chat
+        from .codex_chat import binary
+
+        account, sync = clawbot.state()
+        print("微信 ClawBot 已绑定" if account else "微信 ClawBot 等待扫码绑定")
+        print("收到过私聊" if sync.get("context") else "尚未收到私聊")
+        if sync.get("last_poll_at"):
+            print("微信收件接口已响应")
+        if sync.get("last_reply_at"):
+            print("微信接口已接受私聊回复")
+        print(f"当前默认问答引擎：{clawbot.chat_provider()}")
+        print(f"已配置 Gemini API Key（模型 {gemini_chat.model_name()}）" if clawbot.gemini_key() else "尚未配置 Gemini API Key")
+        print("可调用本机官方 Gemini CLI（个人账号）" if gemini_chat.binary() else "未安装本机官方 Gemini CLI")
+        print("可调用本机 Codex CLI" if binary() else "未找到本机 Codex CLI")
+        if clawbot.openai_key():
+            print("已配置备用 OpenAI API Key")
+        return 0
+    if args.action == "chat-gemini-setup":
+        import requests
+        from . import gemini_chat
+
+        if not sys.stdin.isatty():
+            print("请在本机终端运行此命令，输入会隐藏。")
+            return 1
+        key = getpass("粘贴 Gemini API Key（来自 Google AI Studio）：").strip()
+        if not key:
+            print("未输入 Gemini API Key。")
+            return 1
+        try:
+            gemini_chat.verify_api_key(key)
+        except requests.RequestException as exc:
+            print(f"Gemini API 验证失败（{type(exc).__name__}）。")
+            return 1
+        clawbot.save_gemini_key(key)
+        clawbot.save_chat_provider("gemini")
+        print(f"Gemini API Key 已保存并设为默认问答引擎（模型 {gemini_chat.model_name()}），可在微信私聊直接发问题验证。")
+        return 0
+    if args.action == "chat-gpt-setup":
+        import requests
+
+        if not sys.stdin.isatty():
+            print("请在本机终端运行此命令，输入会隐藏。")
+            return 1
+        key = getpass("粘贴 OpenAI API Key：").strip()
+        if not key:
+            print("未输入 OpenAI API Key。")
+            return 1
+        try:
+            response = requests.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {key}"},
+                                    timeout=10, allow_redirects=False)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"OpenAI API 验证失败（{type(exc).__name__}）。")
+            return 1
+        clawbot.save_openai_key(key)
+        print("OpenAI API Key 已保存，可在 ClawBot 私聊发普通问题验证。")
+        return 0
+    if args.action == "status":
+        queued, open_orders = wechat.counts()
+        provider, token = wechat.read_channel()
+        print(f"微信推送凭证已配置（{wechat.PROVIDER_NAMES[provider]}）" if token else "微信尚未绑定")
+        print(f"待提交推送 {queued} 条，待跟踪 Webull 订单 {open_orders} 笔")
+        return 0
+    if args.action == "setup":
+        if not sys.stdin.isatty():
+            print("请在本机终端运行绑定命令，以隐藏输入的 Token。")
+            return 1
+        provider = args.provider or "pushplus"
+        token_label = "PushPlus 消息 Token" if provider == "pushplus" else "WPush API Key"
+        token = getpass(f"粘贴 {token_label}（输入不会显示）：").strip()
+    else:
+        provider, token = wechat.read_channel()
+    if not token:
+        print("缺少微信推送凭证，请先运行 wechat setup。")
+        return 1
+    try:
+        receipt = wechat.push("SOXL/SOXS 微信通知测试", "这是通道测试，没有发送证券订单。", token,
+                              provider=provider)
+    except (OSError, ValueError, wechat.PushError) as exc:
+        error = str(exc) if isinstance(exc, wechat.PushError) else type(exc).__name__
+        print(f"提交测试通知失败（{error}）")
+        return 1
+    if args.action == "setup":
+        wechat.save_channel(provider, token)
+    print(f"{wechat.PROVIDER_NAMES[provider]} 已接收测试消息，请在微信公众号确认收到。流水号 {receipt}")
+    return 0
+
+
+def cmd_full_buy_plan(args, s):
+    from .full_buy_plan import plan_futu, plan_webull
+    from .webull_client import WebullClient
+
+    limit = args.limit
+    if not limit.is_finite() or limit <= 0 or limit != limit.quantize(Decimal("0.01")):
+        raise SystemExit("限价必须为正数，最多两位小数")
+    prod = load_settings(args.config, environment="prod")
+    status = 0
+    print(f"{args.symbol} 计划买入限价 USD {limit}（只读预检）")
+    for name, plan in (
+        ("Futu", lambda: plan_futu(args.symbol, limit, args.session)),
+        ("Webull", lambda: plan_webull(WebullClient(prod), args.webull_account_suffix,
+                                       args.symbol, limit, args.session)),
+    ):
+        try:
+            result = plan()
+            print(name, json.dumps(result, ensure_ascii=False))
+        except Exception as exc:
+            print(f"{name} 预检失败：{exc}")
+            status = 1
+    return status
 
 
 def _my_order_ids() -> set[str]:
@@ -369,17 +505,25 @@ def cmd_overnight(args, s):
 
 
 def cmd_swing(args, s):
+    from dataclasses import replace
     from datetime import datetime
     from . import swing_live as SL
+    profile = getattr(args, "profile", None)
+    if profile:
+        s = replace(s, environment=f"{s.environment}_{profile}")
     cfg = SL.swing_cfg(s)
     mode = args.mode or "dry_run"
     now = lambda: datetime.now(SL.ET)
     books = SL.Books(s.environment)
     if args.what == "status":
         print(f"环境 {s.environment}  系统权益 ${SL.system_equity(s):,.2f}  账本 {books.data}")
-        if (cfg["tactical"].get("trend_switch") or {}).get("enabled"):
+        trend = cfg["tactical"].get("trend_switch") or {}
+        if trend.get("enabled"):
             cst = SL._load_core_state(s.environment)
-            print(f"双层状态: 持核心={cst.holding} 均价={cst.entry:.2f} 止损冷却={cst.stopped}"
+            peak = cst.peak if cst.peak_day == str(SL.trading_day(now())) else 0.0
+            trail = peak * (1 - trend["trail_pct"])
+            print(f"双层状态: 持核心={cst.holding} 均价={cst.entry:.2f} 日内最高={peak:.2f} "
+                  f"移动止损线={trail:.2f} 止损冷却={cst.stopped}"
                   f"({cst.stopped_day or '-'}) 最近三票={cst.last_votes}")
         day = SL.trading_day(now())
         st = SL._load_state(s.environment, day)
@@ -397,22 +541,25 @@ def cmd_swing(args, s):
         r = backtest_weight(X, L, ensemble_weight(X), allocation=cfg["core"]["allocation"], start="2022-06-01")
         print("核心层:", r.metrics, "按年", yearly(r.equity))
         return 0
-    from .webull_client import WebullClient
-    import time as _time
-    client = None
-    for attempt in range(1, 11):
-        try:
-            client = WebullClient(s)
-            break
-        except Exception as e:
-            if attempt == 10:
-                raise
-            print(f"[swing] 连接 Webull 失败（第 {attempt}/10 次），10 秒后重试：{e}")
-            _time.sleep(10)
-    md = SL.WebullMarket(client, now)
-    broker = SL.make_broker(s, mode, args.confirm_live, cfg["order"])
-    if mode == "dry_run":
-        from dataclasses import replace
+    md = SL.make_market(s, now, source=getattr(args, "market_source", None))
+    print(f"[swing] 行情源: {type(md).__name__}")
+    if mode == "futu-shadow":
+        from .futu_gateway import FutuShadowBroker
+
+        broker = FutuShadowBroker(cfg["order"])
+        if not profile:
+            s = replace(s, environment=broker.book_environment)
+            books = SL.Books(s.environment)
+    elif mode == "futu-sim":
+        from .futu_gateway import FutuSimBroker
+
+        broker = FutuSimBroker(cfg["order"], label=profile or "futu-sim")
+        if not profile:
+            s = replace(s, environment=broker.book_environment)
+            books = SL.Books(s.environment)
+    else:
+        broker = SL.make_broker(s, mode, args.confirm_live, cfg["order"], label=profile or "paper")
+    if mode == "dry_run" and not profile:
         s = replace(s, environment=f"{s.environment}_dry")
         books = SL.Books(s.environment)
     if args.what == "core":
@@ -421,7 +568,43 @@ def cmd_swing(args, s):
             return 0
         SL.core_rebalance(s, md, broker, books)
     elif args.what == "tactical":
-        SL.run_tactical_day(s, md, broker, books, now)
+        run = SL.run_tactical_watch if getattr(args, "watch", False) else SL.run_tactical_day
+        run(s, md, broker, books, now)
+    return 0
+
+
+def cmd_paper_arena(args, s):
+    from datetime import datetime
+    from . import paper_arena as PA
+    from . import swing_live as SL
+
+    if args.action == "status":
+        return PA.print_arena_status(s)
+    if args.companions_only:
+        selected = ["plan_b", "plan_orig"]
+    elif args.profiles:
+        selected = [x.strip() for x in args.profiles.split(",") if x.strip()]
+        invalid = [x for x in selected if x not in PA.PROFILE_MAP]
+        if invalid:
+            raise SystemExit(f"未知模拟盘方案：{invalid}，可选：{list(PA.PROFILE_MAP)}")
+    else:
+        selected = [p.key for p in PA.PROFILES]
+
+    now = lambda: datetime.now(SL.ET)
+    md = SL.make_market(s, now, source=getattr(args, "market_source", None))
+    print(f"[paper-arena] 行情源: {type(md).__name__}")
+    PA.run_arena_watch(
+        s,
+        md,
+        selected,
+        now,
+        a_mode=args.a_mode,
+        b_mode=args.b_mode,
+        orig_mode=args.orig_mode,
+        confirm_live=args.confirm_live,
+        watch=args.watch,
+        poll_seconds=int(SL.swing_cfg(s)["tactical"].get("poll_seconds", 60)),
+    )
     return 0
 
 
@@ -618,9 +801,35 @@ def main(argv=None) -> int:
     e.add_argument("--review", choices=["file", "off"], help=argparse.SUPPRESS)
     e.add_argument("--force", action="store_true", help="今天已经执行过也再执行一次")
     r = sub.add_parser("run", help="运行 SOXL/SOXS 双层策略（默认只打印订单）")
-    r.add_argument("--mode", choices=["dry_run", "webull"], default="dry_run")
+    r.add_argument("--mode", choices=["dry_run", "paper", "webull", "futu-shadow", "futu-sim"], default="dry_run")
+    r.add_argument("--profile", help="独立模拟盘账本后缀（如 plan_b / plan_orig），省略则使用默认主账本")
+    r.add_argument("--market-source", choices=["futu", "webull", "auto"], help="覆盖 config.yaml 中的 swing.market_source")
     r.add_argument("--confirm-live", action="store_true", help="实盘下单的最后一道确认")
-    sub.add_parser("status", help="查看双层策略的仓位和运行状态")
+    r.add_argument("--watch", action="store_true", help="连续监控每个完整交易时段")
+    st_p = sub.add_parser("status", help="查看双层策略的仓位和运行状态")
+    st_p.add_argument("--profile", help="查看指定独立模拟盘账本状态")
+    pa = sub.add_parser("paper-arena", help="三套 SOXL/SOXS 模拟盘并排运行与对比（A 利率双开关 / B 防收割 / 原版基准）")
+    pa_sub = pa.add_subparsers(dest="action", required=True)
+    pa_sub.add_parser("status", help="并排展示三套模拟盘的权益、回撤、持仓与最新日志")
+    pa_run = pa_sub.add_parser("run", help="共享同一份实时行情同步运行模拟盘")
+    pa_run.add_argument("--watch", action="store_true", help="跨交易日连续监控")
+    pa_run.add_argument("--companions-only", action="store_true",
+                        help="只跑 B 版与原版基准（当 Webull 沙盒已有独立进程跑 A 版时避免重复下单）")
+    pa_run.add_argument("--profiles", help="自定义要运行的方案，逗号分隔：plan_a,plan_b,plan_orig")
+    pa_run.add_argument("--market-source", choices=["futu", "webull", "auto"], help="覆盖行情源（默认读 config.yaml）")
+    pa_run.add_argument("--a-mode", choices=["webull", "paper", "dry_run"], default="webull")
+    pa_run.add_argument("--b-mode", choices=["futu-sim", "paper", "dry_run"], default="paper")
+    pa_run.add_argument("--orig-mode", choices=["paper", "dry_run"], default="paper")
+    pa_run.add_argument("--confirm-live", action="store_true")
+    sub.add_parser("futu-check", help="只读检查本机富途 OpenD 美股账户")
+    wx = sub.add_parser("wechat", help="绑定、测试或运行微信交易提醒")
+    wx.add_argument("action", choices=["setup", "test", "status", "watch", "chat-login", "chat-status", "chat-gpt-setup", "chat-gemini-setup"])
+    wx.add_argument("--provider", choices=["pushplus", "wpush"], help="绑定时选择推送服务，默认 PushPlus")
+    fp = sub.add_parser("full-buy-plan", help="按时段只读核对富途和 Webull 的全仓买入数量")
+    fp.add_argument("symbol", choices=["SOXL", "SOXS"])
+    fp.add_argument("--limit", type=Decimal, required=True, help="实际拟提交的美元限价")
+    fp.add_argument("--session", choices=["regular", "extended", "overnight"], required=True)
+    fp.add_argument("--webull-account-suffix", required=True, help="Webull 生产账户的唯一尾号")
     o = sub.add_parser("orders", help="查看 Webull 账户里本系统下的订单")
     o.add_argument("--days", type=int, default=7)
     o.add_argument("--all", action="store_true", help="显示账户里所有订单（共享沙盒里包括别人的）")
@@ -662,7 +871,8 @@ def main(argv=None) -> int:
     sw = sub.add_parser("swing", help="半导体波段系统：core 每日调仓 / tactical 当天夜盘战术 / status / backtest / study")
     sw.add_argument("what", choices=["core", "tactical", "status", "backtest", "study"])
     sw.add_argument("--fetch", action="store_true", help="study 用：先更新 Yahoo 日线")
-    sw.add_argument("--mode", choices=["dry_run", "webull"], help="默认 dry_run 只打印；webull 才下单")
+    sw.add_argument("--mode", choices=["dry_run", "paper", "webull", "futu-shadow", "futu-sim"], help="默认 dry_run 只打印")
+    sw.add_argument("--profile", help="独立模拟盘账本后缀")
     sw.add_argument("--confirm-live", action="store_true")
     rg = sub.add_parser("regime-bt", help="趋势研判回测：上涨只做 SOXL、下跌只做 SOXS（1996 起，含利率周期和 VIX）")
     rg.add_argument("--fetch", action="store_true", help="先从 Yahoo 更新 ^SOX、SOXL、SOXS、VIX、美债收益率日线")
@@ -703,8 +913,9 @@ def main(argv=None) -> int:
 
     args = p.parse_args(argv)
     s = load_settings(args.config)
-    cmds = {"check": cmd_check, "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
-            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "compare": cmd_compare, "overnight-bt": cmd_overnight, "swing": cmd_swing,
+    cmds = {"check": cmd_check, "futu-check": cmd_futu_check, "full-buy-plan": cmd_full_buy_plan, "wechat": cmd_wechat,
+            "fetch": cmd_fetch, "backtest": cmd_backtest, "scan": cmd_scan,
+            "execute": cmd_execute, "run": cmd_run, "status": cmd_status, "paper-arena": cmd_paper_arena, "orders": cmd_orders, "dashboard": cmd_dashboard, "intraday-bt": cmd_intraday, "compare": cmd_compare, "overnight-bt": cmd_overnight, "swing": cmd_swing,
             "scalp": cmd_scalp, "pair-study": cmd_pair_study, "news-record": cmd_news_record,
             "regime-bt": cmd_regime_bt, "fair-value": cmd_fair_value, "fv-t": cmd_fv_t}
     return cmds[args.cmd](args, s)

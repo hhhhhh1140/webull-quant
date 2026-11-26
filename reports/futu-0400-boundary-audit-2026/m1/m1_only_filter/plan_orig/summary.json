@@ -1,0 +1,55 @@
+{
+  "start": "2026-01-02",
+  "end": "2026-11-24",
+  "days": 226,
+  "equity": 33432.0,
+  "total": 10.144,
+  "cagr": 13.896336670302786,
+  "max_drawdown": -0.30300848135701686,
+  "sharpe": 3.190048507870985,
+  "benchmark": -0.30990685859441147,
+  "closes": 83,
+  "win_rate": 0.5421686746987951,
+  "profit_factor": 2.222067571919753,
+  "stats": {
+    "days_M1": 226,
+    "signal_KOSPI_60m": 26,
+    "tactical_entry": 45,
+    "entry_SOXL": 14,
+    "flatten": 38,
+    "core_entry": 5,
+    "core_stop": 14,
+    "core_rebuy": 10,
+    "entry_SOXS": 31,
+    "tactical_trail": 16,
+    "tactical_rebuy": 23,
+    "tactical_stop": 14,
+    "trend_exit": 1,
+    "signal_KOSPI_5m": 10,
+    "signal_KOSPI_close": 1,
+    "signal_KOSPI_1m": 8
+  },
+  "pnl": {
+    "tactical": 23042.079999999998,
+    "SOXL": 3177.0600000000013,
+    "core_dividends": 0,
+    "core": 7389.920000000003,
+    "SOXS": 19865.019999999997
+  },
+  "drawdown_period": {
+    "peak": "2026-02-25",
+    "trough": "2026-04-02",
+    "peak_equity": 4749.24,
+    "trough_equity": 3310.180000000001
+  },
+  "data": {
+    "source": "Futu K_1M / ALL / NONE",
+    "daily_price_fallback_days": 0,
+    "sessions_with_both_overnight": 226,
+    "sessions_with_partial_rth_grid": 0,
+    "order_limit_offset_bps": 30,
+    "scan_end_et": "04:00",
+    "allow_second_entry": true,
+    "uses_rate_gate": false
+  }
+}

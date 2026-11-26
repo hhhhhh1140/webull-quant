@@ -3,23 +3,18 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.webullquant.tactical</string>
-  <!-- 周一到周五 北京时间 08:45 启动（早于夜盘第一个检查时点；冬令时 10:00 / 夏令时 09:00），运行到次日收盘前平仓后退出 -->
+  <!-- 程序按美东交易日持续运行，核心仓监控覆盖夜盘、盘前、常规盘和盘后。 -->
   <!-- caffeinate -i：运行期间不让 Mac 进入闲置睡眠（合上盖子仍会睡眠） -->
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/caffeinate</string><string>-i</string>
     <string>/Users/hhh/webull-quant/.venv/bin/python</string><string>-u</string><string>-m</string><string>wquant</string>
-    <string>swing</string><string>tactical</string><string>--mode</string><string>webull</string>
+    <string>run</string><string>--watch</string><string>--mode</string><string>webull</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/hhh/webull-quant</string>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>45</integer></dict>
-  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
   <key>StandardOutPath</key><string>/Users/hhh/webull-quant/logs/tactical.out.log</string>
   <key>StandardErrorPath</key><string>/Users/hhh/webull-quant/logs/tactical.err.log</string>
 </dict>

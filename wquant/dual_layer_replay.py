@@ -239,6 +239,7 @@ class Position:
     price: float
     layer: str
     peak: float
+    opened_at: pd.Timestamp
 
 
 @dataclass(slots=True)
@@ -254,8 +255,19 @@ class Order:
 
 
 class Replay:
-    def __init__(self, offset):
+    def __init__(self, offset, core_trail_pct=.12, *, reentry_position_frac=1.0, reentry_trail_pct=None,
+                 first_trail_pct=.08, reentry_stop_pct=.06, core_rebuy_session="RTH",
+                 short_gate=None, scan_end="04:00", allow_reentry=True):
         self.offset = offset
+        self.core_trail_pct = core_trail_pct
+        self.reentry_position_frac = reentry_position_frac
+        self.reentry_trail_pct = reentry_trail_pct
+        self.first_trail_pct = first_trail_pct
+        self.reentry_stop_pct = reentry_stop_pct
+        self.core_rebuy_session = core_rebuy_session
+        self.short_gate = short_gate
+        self.scan_end = scan_end
+        self.allow_reentry = allow_reentry
         self.cash = float(CAPITAL)
         self.position = None
         self.order = None
@@ -268,7 +280,8 @@ class Replay:
     def submit(self, symbol, action, layer, reason, price, t, *, trigger_basis=None):
         sign = 1 if action == "BUY" else -1
         limit = max(.01, round(price * (1 + sign * self.offset), 2))
-        qty = floor(self.cash / limit) if action == "BUY" else self.position.quantity
+        fraction = self.reentry_position_frac if reason == "tactical_rebuy" else 1.0
+        qty = floor(self.cash * fraction / limit) if action == "BUY" else self.position.quantity
         if qty:
             self.order = Order(symbol, action, layer, reason, limit, qty, t, trigger_basis)
 
@@ -279,7 +292,7 @@ class Replay:
         pnl = 0.0
         if order.action == "BUY":
             self.cash -= price * qty
-            self.position = Position(order.symbol, qty, price, order.layer, price)
+            self.position = Position(order.symbol, qty, price, order.layer, price, t)
         else:
             pnl = (price - self.position.price) * qty
             self.cash += price * qty
@@ -342,7 +355,7 @@ class Replay:
             self.cash += dividend
             self.pnl[f"{p.layer}_dividends"] += dividend
 
-    def approximate(self, day, votes, bar, prices):
+    def approximate(self, day, votes, bar, prices, prev):
         """Missing minute data: regular-hours core only, with conservative OHLC ordering."""
         opening, exit_t = local(day, "09:30"), local(day, "16:00")
         if self.position and (votes < 2 or self.position.layer == "tactical"):
@@ -354,25 +367,32 @@ class Replay:
             self.submit("SOXL", "BUY", "core", "core_entry", bar.open, opening)
             if self.order:
                 self.fill(opening, self.order.limit)
+        elif not self.position and votes >= 2 and self.core_stop is not None and self.core_stop < day and bar.open >= prev * 1.05:
+            self.submit("SOXL", "BUY", "core", "core_rebuy", bar.open, opening, trigger_basis=prev)
+            if self.order:
+                self.fill(opening, self.order.limit)
         if self.position:
-            basis = self.position.price
-            stop = basis * .88
-            if bar.low <= stop:
-                self.submit("SOXL", "SELL", "core", "core_stop", min(bar.open, stop), exit_t, trigger_basis=basis)
+            # Use the close to confirm a decline from this day's high when minutes are unavailable.
+            if bar.close <= bar.high * (1 - self.core_trail_pct):
+                self.submit("SOXL", "SELL", "core", "core_stop", bar.close, exit_t, trigger_basis=bar.high)
                 self.fill(exit_t, self.order.limit)
-        elif votes >= 2 and self.core_stop is not None and self.core_stop < day and bar.close >= bar.low * 1.05:
-            # An end-of-day close confirms this session's low came before the rebound.
-            self.submit("SOXL", "BUY", "core", "core_rebuy", bar.close, exit_t, trigger_basis=bar.low)
+        elif votes >= 2 and self.core_stop is not None and self.core_stop < day and bar.close >= prev * 1.05:
+            # Without minutes, today's close is the next observed eligible price after the open.
+            self.submit("SOXL", "BUY", "core", "core_rebuy", bar.close, exit_t, trigger_basis=prev)
             if self.order:
                 self.fill(exit_t, self.order.limit)
 
     def replay_day(self, day, preparation, votes, step, records, prev, korea):
         length = pd.Timedelta(minutes=step)
-        start, stop_scan = local(day - DAY, "21:00"), local(day, "04:00")
+        start = local(day - DAY, "21:00")
+        end_h = int(self.scan_end.split(":")[0])
+        stop_scan = local(day - DAY if end_h >= 16 else day, self.scan_end)
         regular, reentry = local(day, "09:30"), local(day, "15:00")
         # The 12:55 cutoff is used if the verified session ends at 13:00.
         last_rth = max(t for t, b in records.items() if "SOXL" in b and b["SOXL"].session == "RTH")
         flatten = local(day, "12:55" if last_rth.hour == 12 else "15:55")
+        session_start = local(day - DAY, "20:00")
+        session_end = local(day, "17:00" if last_rth.hour == 12 else "20:00")
         previous = {"SOXL": prev}
         path_low = min([prev] + [b.low for b in preparation])
         path_high = max([prev] + [b.high for b in preparation])
@@ -381,21 +401,26 @@ class Replay:
         times = sorted(set(records) | set(step_ends) | set(scan_ticks) | {regular, flatten})
         open_attempted = False
         last_overnight = None
-        regular_low = float("inf")
+        core_day_high = 0.0
         allowed_target = {"SOXS"} if votes <= -2 else {"SOXL"} if votes >= 2 or self.core_stop else set(TICKERS)
+        if self.short_gate is not None and not bool(self.short_gate.get(day, False)):
+            allowed_target = allowed_target - {"SOXS"}
         for t in times:
+            if t < session_start or t > session_end:
+                continue
             new = records.get(t, {})
             closed = step_ends.get(t, {})
             for symbol, bar in closed.items():
                 previous[symbol] = bar.close
+            if t == session_end:
+                break
             long = closed.get("SOXL")
             if long:
+                core_day_high = max(core_day_high, long.high)
                 if long.session == "OVN":
                     last_overnight = long.close
                 path_low = min(path_low, long.low)
                 path_high = max(path_high, long.high)
-                if long.session == "RTH":
-                    regular_low = min(regular_low, long.low)
             p = self.position
             if p and p.layer == "tactical" and t >= flatten:
                 if self.order is None or self.order.reason != "flatten":
@@ -413,31 +438,39 @@ class Replay:
                     if current is not None or b is not None:
                         self.submit(p.symbol, "SELL", p.layer, "trend_exit",
                                     b.close if b else current.open, t)
-                elif p.layer == "core" and b and b.low <= p.price * .88:
-                    self.submit(p.symbol, "SELL", p.layer, "core_stop", min(b.open, p.price * .88, b.close), t,
-                                trigger_basis=p.price)
+                elif p.layer == "core" and b and b.close <= core_day_high * (1 - self.core_trail_pct):
+                    self.submit(p.symbol, "SELL", p.layer, "core_stop", b.close, t, trigger_basis=core_day_high)
+                elif p.layer == "tactical" and b and t < flatten and self.tactical_legs == 2 and self.reentry_trail_pct:
+                    if t - length > p.opened_at:
+                        p.peak = max(p.peak, b.high)
+                        if b.close <= p.peak * (1 - self.reentry_trail_pct):
+                            self.submit(p.symbol, "SELL", p.layer, "tactical_reentry_trail", b.close, t,
+                                        trigger_basis=p.peak)
                 elif p.layer == "tactical" and b and t < flatten:
-                    stop = p.price * (.94 if self.tactical_legs == 1 else .88)
-                    prior_trail = p.peak * .93
+                    stop = p.price * (.94 if self.tactical_legs == 1 else 1 - self.reentry_stop_pct)
+                    prior_trail = p.peak * (1 - self.first_trail_pct)
                     p.peak = max(p.peak, b.high)
                     if self.tactical_legs == 1 and prior_trail > stop and b.low <= prior_trail:
                         self.submit(p.symbol, "SELL", p.layer, "tactical_trail", min(b.open, prior_trail, b.close), t)
                     elif b.low <= stop:
                         self.submit(p.symbol, "SELL", p.layer, "tactical_stop", min(b.open, stop, b.close), t,
                                     trigger_basis=p.price)
-                    elif self.tactical_legs == 1 and b.close <= p.peak * .93:
+                    elif self.tactical_legs == 1 and b.close <= p.peak * (1 - self.first_trail_pct):
                         self.submit(p.symbol, "SELL", p.layer, "tactical_trail", b.close, t)
-            elif not self.order and not p and t < flatten:
-                if votes >= 2 and self.tactical_legs == 0 and regular <= t and not open_attempted:
+            elif not self.order and not p:
+                if votes >= 2 and self.tactical_legs == 0 and not open_attempted:
                     if self.core_stop is None:
                         b = new.get("SOXL")
-                        if b and b.session == "RTH":
+                        if regular <= t < flatten and b and b.session == "RTH":
                             self.submit("SOXL", "BUY", "core", "core_entry", b.open, t)
                             open_attempted = True
-                    elif self.core_stop < day and long and long.session == "RTH" and long.close >= regular_low * 1.05:
-                        self.submit("SOXL", "BUY", "core", "core_rebuy", long.close, t, trigger_basis=regular_low)
+                    elif (self.core_stop < day and long and long.close >= prev * 1.05
+                          and (self.core_rebuy_session != "RTH"
+                               or (regular <= t < flatten and long.session == "RTH"))):
+                        self.submit("SOXL", "BUY", "core", "core_rebuy", long.close, t, trigger_basis=prev)
                         open_attempted = True
-                if (not self.order and self.tactical_legs == 1 and self.tactical_low is not None and t < reentry):
+                if (self.allow_reentry and not self.order and self.tactical_legs == 1 and self.tactical_low is not None
+                        and t < min(reentry, flatten)):
                     b = closed.get(self.tactical_symbol)
                     if b:
                         # With bar data the sell may occur after the low in its execution bar.
@@ -554,14 +587,18 @@ def main(source, output):
                 run.reset_day(d, step, splits, cash_div, {s: bars[s].open for s in TICKERS})
                 if vote < 2:
                     run.core_stop = None
+                closing_prices = {}
                 if step:
                     preparation = minute.afterhours(yesterday, step)
                     k = korea if variant == "hybrid" else NoKorea()
-                    run.replay_day(d, preparation, vote, step, records, prev, k)
+                    closing_prices = run.replay_day(d, preparation, vote, step, records, prev, k)
                 else:
                     run.stats["pre_ovn_launch" if d < OVERNIGHT_LAUNCH else "missing_full_session"] += 1
-                    run.approximate(d, vote, bars["SOXL"], bars)
-                mark = bars[run.position.symbol].close if run.position else 0.
+                    run.approximate(d, vote, bars["SOXL"], bars, prev)
+                mark = 0.
+                if run.position:
+                    symbol = run.position.symbol
+                    mark = closing_prices.get(symbol, bars[symbol].close)
                 run.mark(d, mark, vote)
             perf, curve = summarize(run, data["SOXL"].close)
             name = f"{key}_{variant}"

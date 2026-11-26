@@ -189,6 +189,12 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px
   <div id="errors"></div>
 
   <div class="card" style="margin-bottom:14px">
+    <h2>三套模拟盘实时对比（SOXL / SOXS）</h2>
+    <div class="sub">A 版（Webull 沙盒，利率双开关）· B 版（富途模拟盘/本地，防收割）· 原版 2026 基准（本地模拟），各自独立账本互不干扰</div>
+    <div class="cmp" id="arenaCards"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
     <h2>两套系统对比（实时）</h2>
     <div class="sub">各自独立本金，按收益率比较；权益 = 本金 + 已实现 + 持仓浮盈，后台每分钟记录一次（state/combined_&lt;env&gt;.jsonl）</div>
     <div class="cmp" id="cmpCards"></div>
@@ -513,10 +519,30 @@ function renderCombined(c) {
   });
 }
 
+function renderArena(list) {
+  const el = $("arenaCards");
+  if (!el) return;
+  if (!list || !list.length) { el.innerHTML = '<div class="empty">暂无模拟盘数据</div>'; return; }
+  el.innerHTML = list.map((x) => {
+    const mg = !x.macro_gate_enabled ? "关" : (x.macro_short_allowed === true ? "允许空" : x.macro_short_allowed === false ? "禁空" : "待评估");
+    return `<div class="sys">
+      <h3>${esc(x.label)} <span class="meta">(${esc(x.default_mode)})</span></h3>
+      <div class="big">${fmtUsd(x.equity, 2)} <span class="${signCls(x.return_pct)}" style="font-size:14px">${fmtPct(x.return_pct, 2)}</span></div>
+      <div class="rows">
+        <span>本金</span><b>${fmtUsd(x.capital)}</b>
+        <span>已实现 / 浮动</span><b><span class="${signCls(x.realized)}">${fmtSigned(x.realized, 2)}</span> / <span class="${signCls(x.unrealized)}">${fmtSigned(x.unrealized, 2)}</span></b>
+        <span>最大回撤</span><b class="${signCls(x.max_drawdown)}">${fmtPct(x.max_drawdown, 2)}</b>
+        <span>利率做空门控</span><b>${esc(mg)}</b>
+      </div>
+      <div class="hold">持仓：${esc(x.holding)}<br><span class="meta">${esc(x.summary)}${x.last_log ? `<br>最新：${esc(x.last_log)}` : ""}</span></div>
+    </div>`;
+  }).join("");
+}
+
 let last = null;
 function renderAll(d) {
   last = d;
-  renderHeader(d); renderCombined(d.combined); renderEvents(d.events); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
+  renderHeader(d); renderArena(d.arena); renderCombined(d.combined); renderEvents(d.events); renderSwing(d.swing); renderKpis(d.account); renderEquity(d.account); renderRisk(d);
   renderPositions(d.account); renderOrders(d.account); renderBacktest(d.backtest);
 }
 

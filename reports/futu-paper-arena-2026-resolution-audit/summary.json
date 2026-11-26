@@ -1,0 +1,140 @@
+{
+  "plan_a": {
+    "archived_mixed": {
+      "start": "2026-01-02",
+      "end": "2026-11-24",
+      "days": 226,
+      "equity": 28416.370000000006,
+      "total": 8.472123333333336,
+      "cagr": 11.416178343778885,
+      "max_drawdown": -0.2853561643238909,
+      "sharpe": 3.0904334329791223,
+      "benchmark": -0.3099069154144207,
+      "closes": 70,
+      "win_rate": 0.5571428571428572,
+      "profit_factor": 2.116281592601799,
+      "stats": {
+        "days_M5": 102,
+        "signal_KOSPI_60m": 23,
+        "tactical_entry": 38,
+        "entry_SOXL": 13,
+        "flatten": 31,
+        "core_entry": 5,
+        "core_stop": 13,
+        "core_rebuy": 9,
+        "entry_SOXS": 25,
+        "tactical_trail": 12,
+        "tactical_rebuy": 18,
+        "tactical_stop": 13,
+        "days_M1": 123,
+        "trend_exit": 1,
+        "days_D": 1,
+        "signal_KOSPI_5m": 9,
+        "signal_KOSPI_1m": 6
+      },
+      "pnl": {
+        "tactical": 17095.019999999997,
+        "SOXL": 4923.1900000000005,
+        "core_dividends": 0,
+        "core": 8321.350000000006,
+        "SOXS": 12171.829999999994
+      }
+    },
+    "native_m5": {
+      "total": 2.7609466666666678,
+      "max_drawdown": -0.3472824632235988
+    }
+  },
+  "plan_b": {
+    "archived_mixed": {
+      "start": "2026-01-02",
+      "end": "2026-11-24",
+      "days": 226,
+      "equity": 25250.95,
+      "total": 7.416983333333334,
+      "cagr": 9.877344575181827,
+      "max_drawdown": -0.2598578021207911,
+      "sharpe": 2.9828070486496574,
+      "benchmark": -0.3099069154144207,
+      "closes": 44,
+      "win_rate": 0.5909090909090909,
+      "profit_factor": 3.1267925228034996,
+      "stats": {
+        "days_M5": 102,
+        "signal_KOSPI_60m": 17,
+        "tactical_entry": 28,
+        "entry_SOXL": 7,
+        "flatten": 13,
+        "core_entry": 5,
+        "core_stop": 15,
+        "core_rebuy": 11,
+        "entry_SOXS": 21,
+        "tactical_trail": 10,
+        "tactical_stop": 5,
+        "days_M1": 123,
+        "trend_exit": 1,
+        "days_D": 1,
+        "signal_KOSPI_5m": 7,
+        "signal_KOSPI_1m": 4
+      },
+      "pnl": {
+        "tactical": 12100.349999999999,
+        "SOXL": -472.3999999999987,
+        "core_dividends": 0,
+        "core": 10150.600000000002,
+        "SOXS": 12572.749999999996
+      }
+    },
+    "native_m5": {
+      "total": 3.0050399999999993,
+      "max_drawdown": -0.2792343015893277
+    }
+  },
+  "plan_orig": {
+    "archived_mixed": {
+      "start": "2026-01-02",
+      "end": "2026-11-24",
+      "days": 226,
+      "equity": 30558.729999999992,
+      "total": 9.18624333333333,
+      "cagr": 12.46959415561922,
+      "max_drawdown": -0.4447839666159922,
+      "sharpe": 3.0788657955405494,
+      "benchmark": -0.3099069154144207,
+      "closes": 79,
+      "win_rate": 0.5443037974683544,
+      "profit_factor": 2.3162070475723793,
+      "stats": {
+        "days_M5": 102,
+        "signal_KOSPI_60m": 25,
+        "tactical_entry": 43,
+        "entry_SOXL": 13,
+        "flatten": 34,
+        "core_entry": 5,
+        "core_stop": 13,
+        "core_rebuy": 9,
+        "entry_SOXS": 30,
+        "tactical_trail": 15,
+        "tactical_rebuy": 22,
+        "tactical_stop": 16,
+        "days_M1": 123,
+        "trend_exit": 1,
+        "days_D": 1,
+        "signal_KOSPI_5m": 9,
+        "signal_KOSPI_close": 1,
+        "signal_KOSPI_1m": 8
+      },
+      "pnl": {
+        "tactical": 20883.64,
+        "SOXL": 3945.41,
+        "core_dividends": 0,
+        "core": 6675.090000000002,
+        "SOXS": 16938.23
+      }
+    },
+    "native_m5": {
+      "total": 2.0991233333333352,
+      "max_drawdown": -0.4447839666159922
+    }
+  }
+}

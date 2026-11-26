@@ -20,8 +20,9 @@ class FakeMarket:
     def last_price(self, sym):
         return datetime.now(ET), self.prices[sym]
 
-    def rth_low(self, sym, day, now):
-        return self.prices[sym]
+    def minute_quote(self, sym, since, now):
+        px = self.prices[sym]
+        return now, px, px
 
     def prev_rth_close(self, sym, day):
         return self.prev[sym]
@@ -420,52 +421,185 @@ def test_dual_uptrend_core_stop_and_next_day_rebuy(env):
     assert st1.trend_regime == 1 and st1.core_active_today and not br.orders
     st1 = SL.tactical_step(s, md, br, books, st1, at("09:30"))
     assert books.qty("core", "SOXL") == 30 and br.orders[-1][:2] == ("SOXL", "BUY")
+    md.prices["SOXL"] = 140.0
     st1 = SL.tactical_step(s, md, br, books, st1, at("15:55"))
-    assert st1.done and books.qty("core", "SOXL") == 30
+    assert not st1.done and books.qty("core", "SOXL") == 30
+    assert SL._load_core_state("uat").peak == 140.0
+    SL.tactical_step(s, md, br, books, st1, datetime(DAY.year, DAY.month, DAY.day, 20, tzinfo=ET))
+    assert st1.done
 
-    # The previous close would stop the position at 90, but its entry basis is 100.
+    # The overnight session starts a new high. Yesterday's $140 cannot trigger today's stop.
     day2 = DAY + timedelta(days=1)
     st2 = SL.TacState(day=str(day2))
-    md.prev["SOXL"] = 140.0
-    md.prices["SOXL"] = 90.0
-    st2 = SL.tactical_step(s, md, br, books, st2, at("09:45", day2))
+    md.prices["SOXL"] = 122.0
+    st2 = SL.tactical_step(s, md, br, books, st2, at("21:00", day2))
     assert books.qty("core", "SOXL") == 30
-    md.prices["SOXL"] = 87.5
-    st2 = SL.tactical_step(s, md, br, books, st2, at("10:00", day2))
+    assert SL._load_core_state("uat").peak == 122.0
+    md.prices["SOXL"] = 135.0
+    SL.tactical_step(s, md, br, books, st2, at("22:00", day2))
+    md.prices["SOXL"] = 118.0
+    st2 = SL.tactical_step(s, md, br, books, st2, at("23:00", day2))
     assert st2.done and books.qty("core", "SOXL") == 0
+    assert "核心移动止损" in st2.log[-1]
     cst = SL._load_core_state("uat")
-    assert cst.stopped and cst.stopped_day == str(day2)
+    assert cst.stopped and cst.stopped_day == str(day2) and cst.peak == 0
+    assert not cst.peak_checked_at
+    md.prices["SOXL"] = 135.0
+    SL.tactical_step(s, md, br, books, SL.TacState(day=str(day2)), at("10:00", day2))
+    assert books.qty("core", "SOXL") == 0
 
-    # 第 3 天：止损次日起，盘中从低点 85 反弹 +5% (89.3) → 立刻买回核心 SOXL
+    # 第 3 天：上一交易日收盘为 85，夜盘达到 89.25 买回。
     day3 = DAY + timedelta(days=2)
     st3 = SL.TacState(day=str(day3))
+    md.prev["SOXL"] = 85.0
     md.prices["SOXL"] = 85.0
-    st3 = SL.tactical_step(s, md, br, books, st3, at("09:30", day3))
+    st3 = SL.tactical_step(s, md, br, books, st3, at("20:01", day3))
     assert books.qty("core", "SOXL") == 0 and not st3.done
     md.prices["SOXL"] = 89.5
-    st3 = SL.tactical_step(s, md, br, books, st3, at("10:30", day3))
+    st3 = SL.tactical_step(s, md, br, books, st3, at("20:02", day3))
     assert books.qty("core", "SOXL") > 0 and br.orders[-1][:2] == ("SOXL", "BUY")
-    assert not SL._load_core_state("uat").stopped
+    cst = SL._load_core_state("uat")
+    assert not cst.stopped and cst.entry == 89.5 and cst.peak_day == ""
 
 
-def test_core_buyback_resets_the_low_each_trading_day(env):
+def test_core_waiting_to_rebuy_polls_before_first_tactical_checkpoint(env):
     _, books, _ = env
     s = _dual_settings()
-    market = FakeMarket({"SOXL": 80.0}, {})
+    market = FakeMarket({"SOXL": 104.0}, {"SOXL": 100.0})
+    market.daily_df = _trend_df(up=True)
+    broker = FakeBroker()
+    SL._save_core_state("uat", SL.CoreState(stopped=True, stopped_day=str(DAY - timedelta(days=3))))
+    clock = {"time": at("20:01")}
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if broker.orders:
+            clock["time"] = SL.market_window(DAY)[2]
+        else:
+            clock["time"] += timedelta(seconds=seconds)
+            market.prices["SOXL"] = 106.0
+
+    SL.run_tactical_day(s, market, broker, books, lambda: clock["time"], sleep_fn=sleep, day=DAY)
+    assert sleeps[0] == 60
+    assert broker.orders[0][:2] == ("SOXL", "BUY")
+
+
+def test_regular_hours_buyback_waits_through_overnight(env):
+    _, books, _ = env
+    s = _dual_settings()
+    s.raw["swing"]["tactical"]["trend_switch"]["rebuy_session"] = "RTH"
+    market = FakeMarket({"SOXL": 106.0}, {"SOXL": 100.0})
+    market.daily_df = _trend_df(up=True)
+    broker = FakeBroker()
+    SL._save_core_state("uat", SL.CoreState(stopped=True, stopped_day=str(DAY - timedelta(days=3))))
+    state = SL.TacState(day=str(DAY))
+
+    SL.tactical_step(s, market, broker, books, state, at("20:02"))
+    assert not broker.orders
+    SL.tactical_step(s, market, broker, books, state, at("09:31"))
+    assert broker.orders[0][:2] == ("SOXL", "BUY")
+
+
+def test_core_restarts_after_tactical_exit_and_stops_in_after_hours(env):
+    _, books, _ = env
+    s = _dual_settings()
+    market = FakeMarket({"SOXL": 121.0}, {})
+    broker = FakeBroker()
+    books.add("core", "SOXL", 20)
+    SL._save_core_state("uat", SL.CoreState(holding=True, entry=100.0, peak=140.0, peak_day=str(DAY),
+                                           peak_checked_at=at("15:55").isoformat()))
+    SL._save_state("uat", SL.TacState(day=str(DAY), done=True, decided=True, trend_votes=3, trend_regime=1))
+
+    afternoon = datetime(DAY.year, DAY.month, DAY.day, 17, 1, tzinfo=ET)
+    result = SL.run_tactical_day(s, market, broker, books, lambda: afternoon, day=DAY)
+
+    assert result.done and broker.orders == [("SOXL", "SELL", 20, 121.0)]
+    assert SL._load_core_state("uat").stopped_day == str(DAY)
+
+
+def test_core_quote_reads_overnight_high_after_late_start(monkeypatch):
+    start, _, close = SL.market_window(DAY)
+    stamps = pd.date_range(start, periods=1401, freq="min")
+    bars = pd.DataFrame({"close": 100., "high": 102.}, index=stamps)
+    bars.loc[stamps[5], "high"] = 140.
+    now = close - timedelta(minutes=30)
+    md = SL.WebullMarket(None, lambda: now)
+
+    def page(sym, span, count, end_time=None):
+        available = bars.loc[:pd.Timestamp(end_time, unit="ms", tz="UTC")] if end_time else bars
+        return available.tail(count)
+
+    monkeypatch.setattr(md, "_bars", page)
+    _, _, high = md.minute_quote("SOXL", start, now)
+    assert high == 140.
+
+
+def test_trading_window_includes_overnight_and_shortened_after_hours():
+    thanksgiving = date(2026, 11, 26)
+    half_day = date(2026, 11, 27)
+    assert SL.market_window(thanksgiving) is None
+    open_at, regular_close, closes = SL.market_window(half_day)
+    assert open_at == datetime(2026, 11, 26, 20, tzinfo=ET)
+    assert regular_close == datetime(2026, 11, 27, 13, tzinfo=ET)
+    assert closes == datetime(2026, 11, 27, 17, tzinfo=ET)
+    assert SL.trading_day(closes - timedelta(minutes=1)) == half_day
+    next_day = date(2026, 11, 30)
+    assert SL.next_market_window(closes)[:2] == (next_day, datetime(2026, 11, 29, 20, tzinfo=ET))
+
+
+def test_core_quote_uses_completed_highs_after_cursor(monkeypatch):
+    stamps = pd.date_range(at("09:29"), periods=4, freq="min")
+    bars = pd.DataFrame({"close": [145., 126., 117., 110.], "high": [150., 140., 118., 170.]}, index=stamps)
+    md = SL.WebullMarket(None, lambda: at("09:32"))
+    monkeypatch.setattr(md, "_bars", lambda *args: bars)
+
+    assert md.minute_quote("SOXL", at("09:30"), at("09:32")) == (at("09:32"), 117., 140.)
+    assert md.minute_quote("SOXL", at("09:32"), at("09:32")) is None
+
+
+def test_core_buyback_uses_previous_regular_close_each_trading_day(env):
+    _, books, _ = env
+    s = _dual_settings()
+    market = FakeMarket({"SOXL": 82.0}, {"SOXL": 80.0})
     market.daily_df = _trend_df(up=True)
     broker = FakeBroker()
     SL._save_core_state("uat", SL.CoreState(stopped=True, stopped_day=str(DAY)))
     first_day = DAY + timedelta(days=1)
     second_day = DAY + timedelta(days=2)
 
-    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(first_day)), at("09:30", first_day))
-    assert state.core_day_low == 80.0
-    market.prices["SOXL"] = 90.0
-    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(second_day)), at("09:30", second_day))
-    assert state.core_day_low == 90.0 and not broker.orders
+    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(first_day)), at("09:31", first_day))
+    assert state.core_prev_close == 80.0 and not broker.orders
+    market.prev["SOXL"] = 90.0
+    market.prices["SOXL"] = 94.4
+    state = SL.tactical_step(s, market, broker, books, SL.TacState(day=str(second_day)), at("09:31", second_day))
+    assert state.core_prev_close == 90.0 and not broker.orders
     market.prices["SOXL"] = 94.6
-    SL.tactical_step(s, market, broker, books, state, at("10:00", second_day))
+    state.decided = True
+    afternoon = datetime.combine(second_day, datetime.min.time(), ET) + timedelta(hours=17)
+    SL.tactical_step(s, market, broker, books, state, afternoon)
     assert broker.orders[0][:2] == ("SOXL", "BUY")
+
+
+def test_tactical_half_rebuy_trails_from_reentry_high(env):
+    _, books, _ = env
+    s = _dual_settings()
+    s.raw["swing"]["tactical"].update(reentry_position_frac=.5, reentry_trail_pct=.12)
+    market = FakeMarket({"SOXS": 50.0}, {})
+    broker = FakeBroker()
+    state = SL.TacState(day=str(DAY), decided=True, symbol="SOXS", side=-1, frac=1.0,
+                        stopped=True, low_after_stop=48.0, trend_votes=-3, trend_regime=-1)
+    SL.tactical_step(s, market, broker, books, state, at("08:00"))
+    assert broker.orders == [("SOXS", "BUY", 30, 50.0)]
+
+    market.minute_quote = lambda sym, since, now: (now, market.prices[sym], 60.0)
+    market.prices["SOXS"] = 54.0
+    SL.tactical_step(s, market, broker, books, state, at("08:05"))
+    assert state.peak == 60.0 and state.qty == 30
+    market.prices["SOXS"] = 52.7
+    SL.tactical_step(s, market, broker, books, state, at("08:06"))
+    assert broker.orders[-1] == ("SOXS", "SELL", 30, 52.7)
+    assert state.qty == 0 and "第 2 腿移动止损" in state.log[-1]
 
 
 def test_dual_downtrend_liquidates_core_blocks_long_and_uses_leg2_stop(env):
@@ -482,7 +616,8 @@ def test_dual_downtrend_liquidates_core_blocks_long_and_uses_leg2_stop(env):
     assert st.trend_regime == -1 and books.qty("core", "SOXL") == 0
     assert br.orders[0][:2] == ("SOXL", "SELL") and len(br.orders) == 1  # 做多信号被三票下跌趋势拦截
 
-    # 换成做空信号：买 SOXS → 第 1 腿 6% 止损 → 反弹 3% 买回 → 第 2 腿忽略 6% 止损，跌到 12% 才兜底止损
+    # 换成做空信号：全仓首腿触发 6% 止损，从低点反弹 3% 后半仓买回。
+    s.raw["swing"]["tactical"]["reentry_position_frac"] = .50
     md2 = FakeMarket({"SOXL": 95.0, "SOXS": 50.0}, {"SOXL": 100.0}, kospi=-0.02)
     md2.daily_df = _trend_df(up=False)
     day2 = DAY + timedelta(days=1)
@@ -494,7 +629,8 @@ def test_dual_downtrend_liquidates_core_blocks_long_and_uses_leg2_stop(env):
     assert st2.stopped and st2.qty == 0
     md2.prices["SOXS"] = 48.5                                           # 反弹 >3% → 第 2 腿买回
     st2 = SL.tactical_step(s, md2, br2, books, st2, at("23:00", day2))
-    assert st2.reentries == 1 and st2.qty > 0
+    assert st2.reentries == 1 and st2.qty == 29
+    assert br2.orders[-1] == ("SOXS", "BUY", 29, 48.5)
     md2.prices["SOXS"] = 44.5                                           # 较 48.5 跌 -8.2%（超 6% 但未到 12%）→ 不止损！
     st2 = SL.tactical_step(s, md2, br2, books, st2, at("10:00", day2))
     assert st2.qty > 0

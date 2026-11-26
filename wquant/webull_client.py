@@ -66,6 +66,8 @@ class WebullClient:
             settings.app_key,
             settings.app_secret,
             settings.region_id,
+            connect_timeout=10,
+            timeout=15,
             token_check_duration_seconds=300 if interactive_auth else 15,
             token_check_interval_seconds=5 if interactive_auth else 3,
         )
@@ -185,6 +187,19 @@ class WebullClient:
         from datetime import date, timedelta
         start = str(date.today() - timedelta(days=days))
         return _unwrap_list(_json(self.trade.order_v3.get_order_history(self.account_id, page_size=100, start_date=start)))
+
+    def order_detail(self, client_id: str, *, account_id: str) -> dict:
+        data = _json(self.trade.order_v3.get_order_detail(account_id, client_id))
+        if isinstance(data, dict):
+            data = data.get("data", data.get("result", data))
+        rows = data if isinstance(data, list) else [data]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for order in row.get("orders") or [row]:
+                if order.get("client_order_id") == client_id and order.get("status"):
+                    return order
+        raise LookupError("券商尚未返回该订单状态")
 
     # ---------------- 下单 ----------------
     def preview_order(self, order: dict) -> Any:

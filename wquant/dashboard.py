@@ -259,8 +259,12 @@ def _tactical_live(settings: Settings, prices: dict[str, float]) -> dict:
         px = prices.get(sym) or 0.0
         if not px:
             try:
-                from .webull_client import WebullClient
-                px = SL.WebullMarket(WebullClient(settings), lambda: _dt.now(SL.ET)).last_price(sym)[1]
+                md = SL.make_market(settings, lambda: _dt.now(SL.ET))
+                try:
+                    px = md.last_price(sym)[1]
+                finally:
+                    if hasattr(md, "close"):
+                        md.close()
             except Exception:
                 px = None       # 取不到价格就不算浮盈，不用成本价冒充
         pos = {"symbol": sym, "quantity": qty, "entry": round(entry, 4), "last_price": round(px, 4) if px else None,
@@ -318,6 +322,13 @@ def collect(settings: Settings) -> dict:
     except Exception as e:
         data["combined"] = None
         data.setdefault("errors", {})["combined"] = f"{type(e).__name__}: {e}"[:300]
+    try:
+        from .paper_arena import arena_snapshot
+        prices = (data.get("account") or {}).get("last_prices") or {}
+        data["arena"] = arena_snapshot(settings, prices=prices)
+    except Exception as e:
+        data["arena"] = None
+        data.setdefault("errors", {})["arena"] = f"{type(e).__name__}: {e}"[:300]
     return data
 
 

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.webullquant.wechat</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/hhh/webull-quant/.venv/bin/python</string><string>-u</string><string>-m</string><string>wquant</string>
+    <string>wechat</string><string>watch</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/hhh/webull-quant</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/hhh/webull-quant/logs/wechat.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/hhh/webull-quant/logs/wechat.err.log</string>
+</dict>
+</plist>

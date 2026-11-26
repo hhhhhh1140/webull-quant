@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.webullquant.arena</string>
+  <!-- 与 com.webullquant.tactical（Webull 沙盒跑 A 版）互补，后台同步运行 B 版（富途美股模拟盘）与原版 1150%（本地模拟盘） -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string><string>-i</string>
+    <string>/Users/hhh/webull-quant/.venv/bin/python</string><string>-u</string><string>-m</string><string>wquant</string>
+    <string>paper-arena</string><string>run</string><string>--watch</string><string>--companions-only</string><string>--b-mode</string><string>paper</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/hhh/webull-quant</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/hhh/webull-quant/logs/arena.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/hhh/webull-quant/logs/arena.err.log</string>
+</dict>
+</plist>

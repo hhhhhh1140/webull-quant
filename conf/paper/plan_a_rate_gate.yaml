@@ -1,0 +1,20 @@
+# 模拟盘方案 A：更新后的 A 版（Webull 沙盒）
+# 在原版基础上增加宏观利率双紧缩门控：^IRX 且 ^TNX > SMA60 才允许夜盘做空 SOXS；
+# 保留 21:00-04:00 扫描与允许第 2 腿买回。
+swing:
+  tactical:
+    checkpoints: ["21:00", "23:00", "01:30", "04:00"]
+    reentry: true
+    max_reentries: 1
+    reentry_position_frac: 1.0
+    reentry_stop_pct: 0.06
+    macro_short_gate:
+      enabled: true
+      symbols: ["^IRX", "^TNX"]
+      sma_window: 60
+    path:
+      enabled: true
+      scan: continuous
+      scan_from: "21:00"
+      scan_to: "04:00"
+      veto_pct: 0.06

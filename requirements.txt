@@ -5,4 +5,6 @@ exchange-calendars>=4.5,<5
 numpy>=1.24
 pyyaml>=6
 python-dotenv>=1.0
+qrcode>=8,<9
+requests>=2.31,<3
 pytest>=8
