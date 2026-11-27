@@ -65,6 +65,12 @@ DEFAULTS = {
                           "scan_from": None, "scan_to": None},  # 连续扫描的起止时间（美东），None = 第一个 / 最后一个检查时点   # checkpoints = 只在检查时点判断；continuous = 首个到最后一个时点之间每次轮询都判断
                  # 宏观利率门控：开启后要求全部利率标的（如 ^IRX、^TNX）昨日收盘均高于 SMA(window)，才允许夜盘做空 SOXS
                  "macro_short_gate": {"enabled": False, "symbols": ["^IRX", "^TNX"], "sma_window": 60},
+                 # 暴跌极值反转抓底（模式 A）：SOXL/SOXS 单日常规盘收盘暴跌 <= -25% 时，
+                 # 收盘后（16:00 ET / 半日市 13:00 ET）起至次日 09:45 ET 用 1 分钟线右侧确认抓底（临时豁免三票/利率门控）
+                 "crash_reversal": {"enabled": False, "drop_threshold": -0.25, "start_delay_minutes": 0,
+                                    "entry_end": "09:45", "wait_minutes": 20, "bounce_pct": 0.02,
+                                    "ema_window": 20, "position_frac": 1.0,
+                                    "stop_pct": 0.10, "trail_arm_pct": 0.12, "trail_pct": 0.10},
                  # 动态仓位 = base × 信号强弱倍数 × 趋势效率系数，限制在 [min, max]
                  "sizing": {"mode": "dynamic", "base": 0.33, "signal_cap": 2.0, "use_trend_efficiency": False,
                             "trend_index": "SOXX", "er_window": 10, "er_tiers": [[0.2, 0.6], [0.4, 1.0], [99, 1.3]],
@@ -316,6 +322,21 @@ class WebullMarket:
         b = self._bars(sym, "M1", 3)
         return b.index[-1].to_pydatetime(), float(b.close.iloc[-1])
 
+    def minute_bars(self, sym: str, since: datetime, now: datetime) -> pd.DataFrame:
+        """返回已收盘的 1 分钟 OHLCV（bar-start 美东索引）。"""
+        minute = timedelta(minutes=1)
+        count = min(1200, max(30, math.ceil((now - since) / minute) + 5))
+        bars = self._bars(sym, "M1", count)
+        if bars.empty:
+            return bars
+        if len(bars) == 1200 and bars.index[0] > since:
+            end_time = int((bars.index[0] - timedelta(seconds=1)).timestamp() * 1000)
+            remaining = max(3, math.ceil((bars.index[0] - since) / minute) + 1)
+            earlier = self._bars(sym, "M1", min(1200, remaining), end_time=end_time)
+            if not earlier.empty:
+                bars = pd.concat([earlier.loc[earlier.index < bars.index[0]], bars])
+        return bars.loc[(bars.index >= since) & (bars.index + minute <= now)]
+
     def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None:
         """返回新收盘的分钟线中最后一根的结束时刻、收盘价和这段的最高价。"""
         minute = timedelta(minutes=1)
@@ -388,6 +409,10 @@ class CachedMarket:
 
     def last_price(self, sym: str) -> tuple[datetime, float]:
         return self._get(("last", sym), self.quote_ttl, lambda: self.inner.last_price(sym))
+
+    def minute_bars(self, sym: str, since: datetime, now: datetime) -> pd.DataFrame:
+        key = ("mbars", sym, since.replace(second=0, microsecond=0).isoformat(), now.replace(second=0, microsecond=0).isoformat())
+        return self._get(key, self.quote_ttl, lambda: self.inner.minute_bars(sym, since, now))
 
     def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None:
         key = ("mq", sym, since.isoformat() if since else None, now.replace(second=0, microsecond=0).isoformat())
@@ -525,6 +550,11 @@ class TacState:
     core_prev_close: float | None = None
     macro_short_allowed: bool | None = None         # 宏观利率门控结果（True 允许夜盘做空 SOXS / False 禁止）
     macro_short_note: str = ""
+    crash_checked: bool = False                     # 是否已完成昨日暴跌（模式 A）检查
+    crash_symbol: str = ""                          # 触发模式 A 的暴跌标的（SOXL / SOXS）
+    crash_prev_ret: float | None = None             # 昨日暴跌幅度（收盘对前日收盘）
+    crash_active: bool = False                      # 当前持仓是否为模式 A 抓底仓
+    crash_note: str = ""                            # 模式 A 最近一次监控说明
     log: list = field(default_factory=list)
 
 
@@ -738,11 +768,108 @@ def eval_trend_switch(settings: Settings, md: Market, day: date) -> tuple[int, i
     return votes, reg, f"三票制 {idx_sym}({idx_date}) = {votes:+d} 票 → {lab}"
 
 
+def prev_trading_day(day: date) -> date:
+    """返回 day 之前的上一个美股交易日。"""
+    d = day - timedelta(days=1)
+    while market_window(d) is None:
+        d -= timedelta(days=1)
+    return d
+
+
+def next_trading_day(day: date) -> date:
+    """返回 day 之后的下一个美股交易日。"""
+    d = day + timedelta(days=1)
+    while market_window(d) is None:
+        d += timedelta(days=1)
+    return d
+
+
+def crash_window_start(day: date, cr_cfg: dict) -> datetime:
+    """模式 A 监控起点：上一交易日常规盘收盘（16:00 ET / 半日市 13:00 ET）+ start_delay_minutes。"""
+    prev_d = prev_trading_day(day)
+    prev_win = market_window(prev_d)
+    assert prev_win is not None
+    delay = int((cr_cfg or {}).get("start_delay_minutes") or 0)
+    return prev_win[1] + timedelta(minutes=delay)
+
+
+def _symbol_day_return(md: Market, sym: str, prev_d: date, day: date) -> float | None:
+    """计算 sym 在 prev_d 的常规盘收盘相对前一日收盘的涨跌幅（兼容刚收盘日线未更新时段与拆合股）。"""
+    daily = md.daily(sym, 10)
+    if daily is not None and not daily.empty:
+        d_le = daily.loc[daily.index.date <= prev_d]
+        if len(d_le) >= 2 and d_le.index[-1].date() == prev_d:
+            c0, c1 = float(d_le["close"].iloc[-2]), float(d_le["close"].iloc[-1])
+            return (c1 / c0 - 1.0) if c0 > 0 else None
+        d_lt = daily.loc[daily.index.date < prev_d]
+        if len(d_lt) >= 1:
+            c0 = float(d_lt["close"].iloc[-1])
+            c1 = float(md.prev_rth_close(sym, day))
+            return (c1 / c0 - 1.0) if c0 > 0 else None
+    return None
+
+
+def eval_crash_reversal_trigger(md: Market, day: date, t_cfg: dict) -> tuple[str, float | None, str]:
+    """检查上一交易日常规盘收盘后是否触发模式 A（SOXL/SOXS 单日暴跌 <= drop_threshold）。"""
+    cr_cfg = t_cfg.get("crash_reversal") or {}
+    if not cr_cfg.get("enabled"):
+        return "", None, ""
+    th = float(cr_cfg.get("drop_threshold", -0.25))
+    prev_d = prev_trading_day(day)
+    cands: list[tuple[float, str]] = []
+    for sym in (t_cfg["long"], t_cfg["short"]):
+        ret = _symbol_day_return(md, sym, prev_d, day)
+        if ret is not None and ret <= th:
+            cands.append((ret, sym))
+    if not cands:
+        return "", None, ""
+    cands.sort()
+    ret, sym = cands[0]
+    return sym, ret, f"模式 A 唤醒：{prev_d} {sym} 单日暴跌 {ret:+.1%}（≤ {th:.0%}），盘后/夜盘启用 1m 右侧抓底"
+
+
+def eval_crash_reversal_entry_1m(
+    bars: pd.DataFrame | None,
+    window_start: datetime,
+    now: datetime,
+    cr_cfg: dict,
+) -> tuple[bool, float | None, float | None, str]:
+    """用已收盘 1 分钟 K 线评估模式 A 右侧入场确认（连续 N 分钟不破低 + 反弹 >= bounce + 站上 1m EMA）。"""
+    if bars is None or bars.empty:
+        return False, None, None, "模式 A 等待 1m K 线数据"
+    ema_span = max(2, int(cr_cfg.get("ema_window", 20)))
+    ema = bars["close"].astype(float).ewm(span=ema_span, adjust=False).mean()
+    post = bars.loc[bars.index >= window_start]
+    if post.empty:
+        return False, None, None, "模式 A 等待盘后首根 1m K 线收盘"
+    lows = post["low"].astype(float)
+    run_low = float(lows.min())
+    low_ts = lows.idxmin()
+    last_ts = post.index[-1]
+    last_end = last_ts.to_pydatetime() + timedelta(minutes=1)
+    last_close = float(post["close"].iloc[-1])
+    last_ema = float(ema.loc[last_ts])
+    waited_min = (last_ts - low_ts).total_seconds() / 60.0
+    wait_req = float(cr_cfg.get("wait_minutes", 20))
+    bounce_req = float(cr_cfg.get("bounce_pct", 0.02))
+    bounced = (last_close / run_low - 1.0) if run_low > 0 else 0.0
+    fresh = (now - last_end) <= timedelta(minutes=3)
+    ok = fresh and waited_min >= wait_req and bounced >= bounce_req and last_close > last_ema
+    desc = (
+        f"模式 A 1m：盘后低点 {run_low:.2f}（已稳 {waited_min:.0f}/{wait_req:.0f}m），"
+        f"现价 {last_close:.2f}（反弹 {bounced:+.1%}/{bounce_req:+.0%}），"
+        f"EMA{ema_span} {last_ema:.2f}（{'上方' if last_close > last_ema else '下方'}）"
+    )
+    return ok, last_close, run_low, desc
+
+
 def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacState, now: datetime,
                   dry: bool = False) -> TacState:
     """在当前时间点做一次检查（守护进程每隔 poll_seconds 调一次）。"""
     t = swing_cfg(settings)["tactical"]
     ts_cfg = t.get("trend_switch") or {}
+    cr_cfg = t.get("crash_reversal") or {}
+    cr_enabled = bool(cr_cfg.get("enabled"))
     dual = bool(ts_cfg.get("enabled"))
     day = date.fromisoformat(st.day)
     if st.done:
@@ -752,7 +879,9 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
         st.done = True
         return st
     session_start, regular_close, session_end = window
-    if now < session_start:
+    cr_start = crash_window_start(day, cr_cfg) if cr_enabled else session_start
+    effective_start = min(session_start, cr_start)
+    if now < effective_start:
         return st
     tactical_exit = min(_at(day, t["exit"]), regular_close - timedelta(minutes=5))
 
@@ -852,6 +981,113 @@ def tactical_step(settings: Settings, md: Market, broker, books: Books, st: TacS
 
     if not st.equity_start:
         st.equity_start = system_equity(settings)
+
+    def _run_crash_reversal_step() -> bool:
+        """执行模式 A（暴跌后 1m 右侧抓底与风控）。返回 True 表示本轮已由模式 A 处理完毕。"""
+        if not cr_enabled and not st.crash_active:
+            return False
+        core_sym_local = ts_cfg.get("core_symbol", t["long"])
+        has_core = dual and int(books.qty("core", core_sym_local)) > 0
+
+        # 1) 尚未检查昨日是否暴跌：在盘后或开盘前完成一次判定
+        if cr_enabled and not st.crash_checked and not st.decided and st.qty == 0:
+            sym_c, ret_c, msg_c = eval_crash_reversal_trigger(md, day, t)
+            st.crash_checked = True
+            if sym_c and not has_core:
+                st.crash_symbol = sym_c
+                st.crash_prev_ret = round(ret_c, 5) if ret_c is not None else None
+                st.crash_note = msg_c
+                note(msg_c)
+            elif sym_c and has_core:
+                st.crash_symbol = ""
+                st.crash_note = f"昨日 {sym_c} 暴跌 {ret_c:+.1%}，但当前持有核心仓，跳过模式 A"
+                note(st.crash_note)
+            else:
+                st.crash_symbol = ""
+
+        # 2) 已持有模式 A 仓位：按模式 A 独立风控（-10% 固定止损 / +12% 启动 10% 移动止盈 / 收盘前平仓）
+        if st.crash_active:
+            sym_a = st.symbol or st.crash_symbol
+            if now >= tactical_exit:
+                if st.qty:
+                    _, px_a = md.last_price(sym_a)
+                    exit_(px_a, "模式 A 收盘前平仓")
+                st.done = True
+                note(f"今天结束（模式 A），战术层 ${st.pnl:+,.0f}，系统权益 ${system_equity(settings):,.0f}")
+                return True
+            if st.qty:
+                quote = md.minute_quote(sym_a, None, now) if hasattr(md, "minute_quote") else None
+                if quote is not None and (now - quote[0]) <= timedelta(minutes=3):
+                    _, px_a, hi_a = quote
+                else:
+                    _, px_a = md.last_price(sym_a)
+                    hi_a = px_a
+                st.peak = max(st.peak or px_a, px_a, hi_a)
+                sl_pct = float(cr_cfg.get("stop_pct", 0.10))
+                arm_pct = float(cr_cfg.get("trail_arm_pct", 0.12))
+                tr_pct = float(cr_cfg.get("trail_pct", 0.10))
+                stop = st.entry * (1.0 - sl_pct)
+                trail = st.peak * (1.0 - tr_pct)
+                if px_a <= stop:
+                    exit_(px_a, f"模式 A 硬止损：跌破均价 {sl_pct:.0%}", stop_price=stop)
+                    st.stopped = True
+                    if not st.qty:
+                        st.done = True
+                elif st.peak >= st.entry * (1.0 + arm_pct) and px_a <= trail:
+                    exit_(px_a, f"模式 A 移动止盈：从最高 {st.peak:.2f} 回撤 {tr_pct:.0%}", stop_price=trail)
+                    st.stopped = True
+                    if not st.qty:
+                        st.done = True
+                return True
+            st.done = True
+            return True
+
+        # 3) 模式 A 已唤醒但尚未进场：16:00 ET 至次日 entry_end 用 1m K 线右侧确认
+        if st.crash_symbol and not st.decided:
+            if has_core:
+                st.crash_symbol = ""
+                return False
+            if KILL_SWITCH.exists():
+                note("KILL_SWITCH 存在，模式 A 今天不开仓")
+                st.decided = st.done = True
+                return True
+            entry_end = _at(day, str(cr_cfg.get("entry_end") or "09:45"))
+            if now > entry_end:
+                note(f"模式 A 已过入场窗口（{cr_cfg.get('entry_end', '09:45')} ET）未确认，今天不做")
+                st.decided = st.done = True
+                return True
+            if now < cr_start:
+                return True
+            bars = md.minute_bars(st.crash_symbol, cr_start - timedelta(minutes=60), now) if hasattr(md, "minute_bars") else None
+            ok, cpx, run_low, desc = eval_crash_reversal_entry_1m(bars, cr_start, now, cr_cfg)
+            if ok and cpx is not None:
+                st.decided = True
+                st.side = 1 if st.crash_symbol == t["long"] else -1
+                st.gate = f"模式 A 接管（{st.crash_symbol} 暴跌反转，豁免三票/利率门控）"
+                st.frac = float(cr_cfg.get("position_frac", 1.0))
+                st.sizing_note = f"模式 A 固定 {st.frac:.0%}"
+                why = f"{desc} → 触发买入"
+                if enter(st.crash_symbol, cpx, why, position_frac=st.frac):
+                    st.crash_active = True
+                    st.crash_note = why
+                else:
+                    st.done = True
+                return True
+            tag = desc.split("，")[0] if "，" in desc else desc
+            if tag != st.crash_note:
+                st.crash_note = tag
+                note(desc + "，继续观察")
+            return True
+        return False
+
+    # 在上一交易日盘后（16:00–19:59 ET）只跑模式 A，不进入常规夜盘逻辑
+    if now < session_start:
+        _run_crash_reversal_step()
+        return st
+
+    # 进入交易日后，若触发模式 A 或持有模式 A 仓位，由模式 A 接管并跳过常规战术层
+    if _run_crash_reversal_step():
+        return st
 
     # 0) 三票制双层动态切换：先确定当天大趋势，并协调核心层与战术层
     cst = _load_core_state(settings.environment) if dual else None
@@ -1159,6 +1395,11 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
     if _continuous(t):
         lo_t, hi_t = _scan_window(t, day)
         print(f"[战术层] 连续扫描 {lo_t:%H:%M}–{hi_t:%H:%M} ET（每 {t['poll_seconds']} 秒），看昨收以来的高低点 / VWAP")
+    if (t.get("crash_reversal") or {}).get("enabled"):
+        cr = t["crash_reversal"]
+        print(f"[模式 A] 暴跌反转抓底已启用：单日收盘 ≤ {cr['drop_threshold']:.0%} 后，"
+              f"盘后起至次日 {cr['entry_end']} ET 用 1m 确认（稳 {cr['wait_minutes']}m + 反弹 {cr['bounce_pct']:.0%} + >EMA{cr['ema_window']}，"
+              f"硬止损 {cr['stop_pct']:.0%} / +{cr['trail_arm_pct']:.0%} 启 {cr['trail_pct']:.0%} 移止）")
     flat = min(_at(day, t["exit"]), regular_close - timedelta(minutes=5))
     print(f"[战术层] 交易日 {day}：检查时点 {', '.join(t['checkpoints'])} ET，{flat:%H:%M} ET 平仓；"
           f"系统权益 ${system_equity(settings):,.0f}，每笔 {t['position_frac']:.0%}")
@@ -1176,7 +1417,9 @@ def run_tactical_day(settings: Settings, md: Market, broker, books: Books, now_f
         core_flat = (ts_cfg.get("enabled") and st.trend_regime == 1 and st.qty == 0
                      and st.trades == 0 and not books.qty("core", ts_cfg.get("core_symbol", t["long"])))
         waiting_to_rebuy = core_flat and _load_core_state(settings.environment).stopped
-        if core_flat and st.decided and now < core_start and not waiting_to_rebuy:
+        if st.crash_symbol and not st.decided:
+            sleep_fn(max(1.0, min(float(t["poll_seconds"]), (session_end - now_fn()).total_seconds())))
+        elif core_flat and st.decided and now < core_start and not waiting_to_rebuy:
             sleep_fn(max(1.0, (core_start - now_fn()).total_seconds()))
         elif not st.decided and not waiting_to_rebuy:
             pending = [_at(day, c) for c in t["checkpoints"] if c not in st.evaluated]
@@ -1215,7 +1458,7 @@ def next_market_window(now: datetime) -> tuple[date, datetime, datetime]:
 
 def run_tactical_watch(settings: Settings, md: Market, broker, books: Books,
                        now_fn: Callable[[], datetime], sleep_fn: Callable[[float], None] = _time.sleep) -> None:
-    """在每个交易窗口运行策略，闭市时等待下一场夜盘。"""
+    """在每个交易窗口运行策略；若启用模式 A，收盘后（16:00–20:00 ET）自动衔接次日暴跌抓底监控。"""
     while True:
         now = now_fn()
         day, opens, closes = next_market_window(now)
@@ -1223,6 +1466,30 @@ def run_tactical_watch(settings: Settings, md: Market, broker, books: Books,
             sleep_fn(opens.timestamp() - now.timestamp())
             continue
         run_tactical_day(settings, md, broker, books, now_fn, sleep_fn=sleep_fn, day=day)
+        cfg_t = swing_cfg(settings)["tactical"]
+        cr_cfg = cfg_t.get("crash_reversal") or {}
+        if cr_cfg.get("enabled"):
+            win = market_window(day)
+            regular_close = win[1] if win else closes
+            nxt_day = next_trading_day(day)
+            while True:
+                now = now_fn()
+                if now >= closes:
+                    break
+                if now < regular_close:
+                    sleep_fn(max(1.0, min(closes.timestamp(), regular_close.timestamp() + 5.0) - now.timestamp()))
+                    continue
+                nxt_st = _load_state(settings.environment, nxt_day)
+                if not nxt_st.done:
+                    try:
+                        nxt_st = tactical_step(settings, md, broker, books, nxt_st, now)
+                    except Exception as e:
+                        nxt_st.log.append(f"{now.astimezone(ET):%m-%d %H:%M} 模式A盘后检查出错：{type(e).__name__}: {e}")
+                        print(nxt_st.log[-1])
+                    _save_state(settings.environment, nxt_st)
+                if not nxt_st.crash_symbol or nxt_st.done:
+                    break
+                sleep_fn(max(1.0, min(float(cfg_t["poll_seconds"]), closes.timestamp() - now_fn().timestamp())))
         remaining = closes.timestamp() - now_fn().timestamp()
         if remaining > 0:
             sleep_fn(remaining)

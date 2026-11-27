@@ -224,7 +224,7 @@ def sanitize_futu_0400_spikes(df: pd.DataFrame, prev_rth_closes: dict[date, floa
     """
     if df.empty:
         return df
-    is_0400 = (df.index.hour == 4) & (df.index.minute == 0)
+    is_0400 = (df.index.hour == 4) & (df.index.minute <= 1)
     if not is_0400.any():
         return df
     out = df.copy()
@@ -378,6 +378,21 @@ class FutuMarket:
             return {ref_day - timedelta(days=1): px}
         except Exception:
             return {}
+
+    def minute_bars(self, sym: str, since: datetime, now: datetime) -> pd.DataFrame:
+        """返回富途已收盘 1 分钟 OHLCV（bar-start 美东索引，已过滤 04:00/04:01 昨收假针）。"""
+        minute = timedelta(minutes=1)
+        need = max(30, math.ceil((now - since) / minute) + 10)
+        bars = self._cur_bars(sym, 1, min(need, 1000))
+        if bars.empty or bars.index[0] > since:
+            hist = self._history_bars(sym, 1, since.astimezone(ET).date() - timedelta(days=1), now.astimezone(ET).date())
+            if not hist.empty:
+                bars = pd.concat([hist, bars])
+                bars = bars.loc[~bars.index.duplicated(keep="last")].sort_index()
+        if bars.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "session"])
+        bars = sanitize_futu_0400_spikes(bars, self._prev_rth_map(sym, now.astimezone(ET).date()))
+        return bars.loc[(bars.index >= since) & (bars.index + minute <= now)]
 
     def minute_quote(self, sym: str, since: datetime | None, now: datetime) -> tuple[datetime, float, float] | None:
         """返回富途已收盘 1 分钟线的最后收盘时刻、收盘价及区间最高价（已过滤 04:00 昨收假针）。"""

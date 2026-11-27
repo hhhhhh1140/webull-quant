@@ -37,7 +37,7 @@ PROFILES: tuple[ArenaProfile, ...] = (
     ArenaProfile(
         key="plan_a",
         label="A版 · 利率双开关",
-        summary="IRX&TNX>SMA60 才做空 SOXS；21:00–04:00；允许二腿",
+        summary="IRX&TNX>SMA60 才做空 SOXS；21:00–04:00；允许二腿；+模式A暴跌抓底",
         config_file=PAPER_CONF_DIR / "plan_a_rate_gate.yaml",
         default_mode="webull",
         env_suffix="",
@@ -45,7 +45,7 @@ PROFILES: tuple[ArenaProfile, ...] = (
     ArenaProfile(
         key="plan_b",
         label="B版 · 防收割满仓",
-        summary="IRX&TNX>SMA60 才做空 SOXS；仅 21:00–23:59；禁二腿",
+        summary="IRX&TNX>SMA60 才做空 SOXS；仅 21:00–23:59；禁二腿；+模式A暴跌抓底",
         config_file=PAPER_CONF_DIR / "plan_b_defensive.yaml",
         default_mode="paper",
         env_suffix="plan_b",
@@ -53,7 +53,7 @@ PROFILES: tuple[ArenaProfile, ...] = (
     ArenaProfile(
         key="plan_orig",
         label="原版 · 2026 基准",
-        summary="无利率开关（原 1150%/919% 版）；21:00–04:00；允许二腿",
+        summary="无利率开关（原 1150%/919% 版）；21:00–04:00；允许二腿；+模式A暴跌抓底",
         config_file=PAPER_CONF_DIR / "plan_orig_baseline.yaml",
         default_mode="paper",
         env_suffix="plan_orig",
@@ -131,6 +131,7 @@ def _profile_snapshot(base: Settings, profile: ArenaProfile, prices: dict[str, f
     states = sorted(journal.STATE.glob(f"swing_tactical_{env}_*.json"))
     last_log = (st.get("log") or [])[-1] if st.get("log") else ""
     macro_cfg = tcfg.get("macro_short_gate") or {}
+    crash_cfg = tcfg.get("crash_reversal") or {}
     return {
         "key": profile.key,
         "label": profile.label,
@@ -151,6 +152,10 @@ def _profile_snapshot(base: Settings, profile: ArenaProfile, prices: dict[str, f
         "macro_gate_enabled": bool(macro_cfg.get("enabled")),
         "macro_short_allowed": st.get("macro_short_allowed"),
         "macro_short_note": st.get("macro_short_note", ""),
+        "crash_reversal_enabled": bool(crash_cfg.get("enabled")),
+        "crash_symbol": st.get("crash_symbol", ""),
+        "crash_active": bool(st.get("crash_active")),
+        "crash_note": st.get("crash_note", ""),
         "gate": st.get("gate", ""),
         "last_log": last_log,
         "history": history[-120:],
@@ -169,11 +174,15 @@ def print_arena_status(base: Settings) -> int:
             "允许空" if r["macro_short_allowed"] is True else
             "禁空" if r["macro_short_allowed"] is False else "待评估"
         )
+        cr = "关" if not r["crash_reversal_enabled"] else (
+            f"持仓中({r['crash_symbol']})" if r["crash_active"] else
+            f"唤醒({r['crash_symbol']})" if r["crash_symbol"] else "待机(≤-25%)"
+        )
         print(f"【{r['label']}】 ({r['key']} | 账本 {r['env']} | 默认 {r['default_mode']})")
         print(f"  规则: {r['summary']}")
         print(f"  本金 ${r['capital']:,.0f}  权益 ${r['equity']:,.2f}  收益 {r['return_pct']:+.2%}"
               f"（已实现 ${r['realized']:+,.2f} / 浮动 ${r['unrealized']:+,.2f}）  最大回撤 {r['max_drawdown']:+.2%}")
-        print(f"  持仓: {r['holding']}  |  利率做空门控: {mg}  |  已监控 {r['watched_days']} 日 / 结算 {r['traded_days']} 笔")
+        print(f"  持仓: {r['holding']}  |  利率门控: {mg}  |  模式A抓底: {cr}  |  已监控 {r['watched_days']} 日 / 结算 {r['traded_days']} 笔")
         if r["last_log"]:
             print(f"  最新: {r['last_log']}")
         print()
@@ -283,6 +292,21 @@ def run_arena_watch(
         if not watch:
             return states
         if all(st.done for st in states.values()):
+            any_crash_enabled = any(
+                bool((SL.swing_cfg(ps)["tactical"].get("crash_reversal") or {}).get("enabled"))
+                for _, ps, _, _ in runners
+            )
+            win = SL.market_window(day)
+            regular_close = win[1] if win else closes
+            if any_crash_enabled and now < closes:
+                if now < regular_close:
+                    sleep_fn(max(1.0, min(closes.timestamp(), regular_close.timestamp() + 5.0) - now_fn().timestamp()))
+                    continue
+                nxt_day = SL.next_trading_day(day)
+                nxt_states = run_arena_tick(runners, shared_md, now, day=nxt_day)
+                if any(st.crash_symbol and not st.done for st in nxt_states.values()):
+                    sleep_fn(max(1.0, min(float(poll_seconds), closes.timestamp() - now_fn().timestamp())))
+                    continue
             remaining = closes.timestamp() - now_fn().timestamp()
             if remaining > 0:
                 sleep_fn(remaining)

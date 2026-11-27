@@ -12,6 +12,17 @@ swing:
       enabled: true
       symbols: ["^IRX", "^TNX"]
       sma_window: 60
+    crash_reversal:
+      enabled: true
+      drop_threshold: -0.25
+      entry_end: "09:45"
+      wait_minutes: 20
+      bounce_pct: 0.02
+      ema_window: 20
+      position_frac: 1.0
+      stop_pct: 0.10
+      trail_arm_pct: 0.12
+      trail_pct: 0.10
     path:
       enabled: true
       scan: continuous

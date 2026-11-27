@@ -178,6 +178,20 @@ swing:
       enabled: true
       symbols: ["^IRX", "^TNX"]
       sma_window: 60
+    # 暴跌极值反转抓底（模式 A）：SOXL/SOXS 单日常规盘收盘暴跌 <= -25% 时，
+    # 收盘后（16:00 ET / 半日市 13:00 ET）起至次日 09:45 ET 用 1 分钟线右侧确认抓底（豁免三票/利率门控）
+    crash_reversal:
+      enabled: true
+      drop_threshold: -0.25
+      start_delay_minutes: 0
+      entry_end: "09:45"
+      wait_minutes: 20
+      bounce_pct: 0.02
+      ema_window: 20
+      position_frac: 1.0
+      stop_pct: 0.10
+      trail_arm_pct: 0.12
+      trail_pct: 0.10
     path:
       enabled: true
       scan: continuous       # 21:00–04:00 ET 每分钟连续扫描
